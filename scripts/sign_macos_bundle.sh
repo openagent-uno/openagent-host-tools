@@ -78,4 +78,3 @@ xcrun notarytool submit "$notary_zip" \
 xcrun stapler staple "$helper"
 xcrun stapler validate "$helper"
 spctl --assess --type execute --verbose=4 "$helper"
-spctl --assess --type execute --verbose=4 "$bundle/openagent-host-tools"

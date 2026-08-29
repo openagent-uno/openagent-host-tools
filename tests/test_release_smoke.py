@@ -3,7 +3,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import importlib.util
+import inspect
 import json
+import os
 import sys
 import tarfile
 from pathlib import Path
@@ -28,6 +30,16 @@ def _load_script(name: str):
 
 smoke_bundle = _load_script("smoke_bundle")
 verify_bundle_archive = _load_script("verify_bundle_archive")
+
+
+def test_linux_xvfb_smoke_prepares_a_real_input_connection():
+    script = SCRIPTS / "smoke_linux_xvfb.sh"
+    text = script.read_text(encoding="utf-8")
+    assert os.access(script, os.X_OK)
+    assert "xdpyinfo" in text
+    assert "xmodmap -e 'keycode 255 ='" in text
+    assert "--computer-control expect-granted" in text
+    assert "env=dict(os.environ)" in inspect.getsource(smoke_bundle._computer_control)
 
 
 def test_computer_control_smoke_validates_cursor_png_and_tcc_errors(tmp_path: Path):

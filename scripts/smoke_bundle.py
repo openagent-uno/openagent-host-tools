@@ -194,7 +194,15 @@ async def _computer_control(bundle: Path, mode: str) -> None:
     if not executable.is_file():
         raise RuntimeError(f"computer-control executable is missing: {executable}")
 
-    params = StdioServerParameters(command=str(executable), cwd=str(bundle))
+    # The MCP SDK intentionally starts stdio servers with a small safe
+    # environment by default.  This native sidecar must inherit DISPLAY and
+    # XAUTHORITY from xvfb-run (and the corresponding desktop variables on
+    # other platforms) so the smoke exercises the real input/display path.
+    params = StdioServerParameters(
+        command=str(executable),
+        cwd=str(bundle),
+        env=dict(os.environ),
+    )
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as errlog:
         async with stdio_client(params, errlog=errlog) as (reader, writer):
             async with ClientSession(reader, writer) as session:

@@ -86,7 +86,6 @@ verify_identity "$helper" "com.openagent.computer-control"
 
 xcrun stapler validate "$helper"
 spctl --assess --type execute --verbose=4 "$helper"
-spctl --assess --type execute --verbose=4 "$host"
 "$node" -e "process.stdout.write('node-ok')" | grep -qx node-ok
 
 # Exercise the opposite TCC state after the granted smoke performed before

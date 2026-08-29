@@ -108,7 +108,7 @@ jobs:
             libxdo-dev libx11-dev libxtst-dev libxi-dev libxrandr-dev \
             libwayland-dev libxkbcommon-dev libpipewire-0.3-dev libdbus-1-dev \
             libegl1-mesa-dev libgl1-mesa-dev libgbm-dev pkg-config \
-            xvfb xauth
+            xvfb xauth x11-utils x11-xserver-utils
       - name: Install build dependencies
         run: python -m pip install -e ".[dev]" pyinstaller
       - name: Build self-contained native bundle
@@ -136,8 +136,7 @@ jobs:
         shell: bash
         run: >-
           xvfb-run -a -s '-screen 0 1280x1024x24'
-          python scripts/smoke_bundle.py dist/${{ matrix.platform }}
-          --core-only --computer-control expect-granted
+          scripts/smoke_linux_xvfb.sh dist/${{ matrix.platform }}
       - name: Smoke frozen core MCP runtime
         if: runner.os == 'Windows'
         run: python scripts/smoke_bundle.py dist/${{ matrix.platform }} --core-only --computer-control skip
