@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shlex
+import subprocess
 import sys
 import threading
 import time
@@ -26,6 +28,12 @@ from openagent_host_tools.types import (
 @pytest.fixture
 def paths(tmp_path: Path) -> HostPaths:
     return HostPaths.discover(tmp_path / "user")
+
+
+def _shell_command(argv: list[str]) -> str:
+    """Quote argv for the platform shell used by ``BackgroundShell``."""
+
+    return subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
 
 
 @pytest.mark.asyncio
@@ -151,7 +159,7 @@ async def test_filesystem_editor_shell_and_durable_idempotency(paths: HostPaths,
             )
         assert read_conflict.value.code == "idempotency_conflict"
 
-        command = shlex.join([sys.executable, "-c", "print('shell-ok')"])
+        command = _shell_command([sys.executable, "-c", "print('shell-ok')"])
         shell = await host.call(
             "shell",
             "shell_exec",
@@ -225,7 +233,7 @@ async def test_background_shells_are_private_to_principal(paths: HostPaths, tmp_
         "device_label": "test",
         "account_id": "network-b",
     }
-    command = shlex.join([sys.executable, "-c", "import time; time.sleep(10)"])
+    command = _shell_command([sys.executable, "-c", "import time; time.sleep(10)"])
     try:
         started = await host.call(
             "shell",
@@ -401,9 +409,14 @@ async def test_thread_backed_mutation_drains_before_indeterminate_timeout(
 async def test_thread_backed_mutation_drains_before_cancel_returns(
     paths: HostPaths, tmp_path: Path
 ):
+    started = threading.Event()
+    release = threading.Event()
+
     class SlowFilesystem(FilesystemServer):
         def _tool_write_file(self, args):
-            time.sleep(0.1)
+            started.set()
+            if not release.wait(timeout=5):
+                raise RuntimeError("test did not release the blocked mutation")
             return super()._tool_write_file(args)
 
     host = CapabilityHost(paths=paths, cwd=tmp_path)
@@ -420,18 +433,25 @@ async def test_thread_backed_mutation_drains_before_cancel_returns(
             call_id="slow-cancel",
         )
     )
-    await asyncio.sleep(0.02)
-    assert await host.cancel("slow-cancel") is True
-    call.cancel()
-    started = time.monotonic()
     try:
+        assert await asyncio.to_thread(started.wait, 2)
+        assert await host.cancel("slow-cancel") is True
+        call.cancel()
+
+        # Cancellation of the orchestration task must not complete while the
+        # already-dispatched filesystem thread can still produce an effect.
+        await asyncio.sleep(0.02)
+        assert call.done() is False
+        assert target.exists() is False
+
+        release.set()
         with pytest.raises(HostError) as exc:
             await call
         assert exc.value.code == "idempotency_indeterminate"
-        assert time.monotonic() - started >= 0.06
         assert target.read_text() == "finished"
         assert (await host.lease.status())["state"] == "free"
     finally:
+        release.set()
         await host.close()
 
 
