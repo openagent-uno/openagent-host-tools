@@ -89,8 +89,15 @@ spctl --assess --type execute --verbose=4 "$helper"
 spctl --assess --type execute --verbose=4 "$host"
 "$node" -e "process.stdout.write('node-ok')" | grep -qx node-ok
 
-# A release runner intentionally has no TCC grants. This proves the final,
-# extracted helper starts as the real MCP and fails with the stable permission
-# error instead of crashing, hanging, or bypassing macOS privacy controls.
+# Exercise the opposite TCC state after the granted smoke performed before
+# packaging. Reset only this helper's stable code-signing identity; never rely
+# on the mutable permission state inherited from a hosted runner image.
+tccutil reset Accessibility com.openagent.computer-control
+tccutil reset ScreenCapture com.openagent.computer-control
+sleep 1
+
+# This proves the final, extracted helper starts as the real MCP and fails with
+# the stable permission error instead of crashing, hanging, or bypassing macOS
+# privacy controls.
 "$python_bin" "$script_dir/smoke_bundle.py" "$bundle" \
   --core-only --computer-control expect-denied

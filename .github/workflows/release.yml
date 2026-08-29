@@ -115,9 +115,9 @@ jobs:
           python scripts/build_standalone.py --manifest-only --expect-platform ${{ matrix.platform }}
       - name: Verify live sidecar catalogs match the version lock
         run: python scripts/snapshot_sidecar_manifests.py dist/${{ matrix.platform }} --check
-      - name: Smoke signed frozen MCP and browser runtime
+      - name: Smoke signed frozen MCP and browser runtime with runner TCC grants
         if: runner.os == 'macOS'
-        run: python scripts/smoke_bundle.py dist/${{ matrix.platform }} --computer-control expect-denied
+        run: python scripts/smoke_bundle.py dist/${{ matrix.platform }} --computer-control expect-granted
       - name: Smoke frozen core and computer-control under Xvfb
         if: runner.os == 'Linux'
         shell: bash

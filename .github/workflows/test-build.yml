@@ -49,10 +49,10 @@ jobs:
           xvfb-run -a -s '-screen 0 1280x1024x24'
           python scripts/smoke_bundle.py dist/*
           --core-only --computer-control expect-granted
-      - name: Smoke frozen core and expected TCC denial
+      - name: Smoke frozen core and computer-control with runner TCC grants
         if: runner.os == 'macOS'
         shell: bash
-        run: python scripts/smoke_bundle.py dist/* --core-only --computer-control expect-denied
+        run: python scripts/smoke_bundle.py dist/* --core-only --computer-control expect-granted
       - name: Smoke frozen core MCP runtime
         if: runner.os == 'Windows'
         shell: bash
