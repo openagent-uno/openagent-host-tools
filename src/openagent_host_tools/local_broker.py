@@ -365,6 +365,13 @@ class LocalBrokerServer:
     def _acquire_singleton(self) -> None:
         lock_path = self.paths.internal / "broker.lock"
         self._lock_file = open(lock_path, "a+b")
+        # msvcrt.locking needs a byte to lock. Initialize only an empty file;
+        # a contender must not modify an already-owned lock before it knows
+        # whether acquisition succeeded.
+        self._lock_file.seek(0, os.SEEK_END)
+        if self._lock_file.tell() == 0:
+            self._lock_file.write(b"0")
+            self._lock_file.flush()
         try:
             if os.name == "nt":
                 import msvcrt
@@ -379,25 +386,24 @@ class LocalBrokerServer:
             self._lock_file.close()
             self._lock_file = None
             raise BrokerAlreadyRunning("local capability broker is already running") from exc
-        # Publish the exact lock owner only after acquiring the singleton. A
-        # contender must never overwrite this marker before its lock attempt;
-        # Desktop/CLI diagnostics and test cleanup use it to identify the
-        # broker for this one isolated host-tools home on every OS.
-        self._lock_file.seek(0)
-        self._lock_file.truncate()
-        self._lock_file.write(str(os.getpid()).encode("ascii"))
-        self._lock_file.flush()
-        os.fsync(self._lock_file.fileno())
+        # Keep the readable owner marker separate from the locked byte: on
+        # Windows, msvcrt prevents another process from reading the locked
+        # region at all. Only the successful owner may publish this PID.
+        try:
+            self.paths.broker_pid.write_text(str(os.getpid()), encoding="ascii")
+            if os.name != "nt":
+                self.paths.broker_pid.chmod(0o600)
+        except BaseException:
+            self._release_singleton()
+            raise
 
     def _release_singleton(self) -> None:
         if self._lock_file is None:
             return
         try:
-            self._lock_file.seek(0)
-            self._lock_file.truncate()
-            self._lock_file.write(b"0")
-            self._lock_file.flush()
-            os.fsync(self._lock_file.fileno())
+            # Remove before unlocking so a successor can never publish its PID
+            # and then have this broker erase it during teardown.
+            self.paths.broker_pid.unlink(missing_ok=True)
             if os.name == "nt":
                 import msvcrt
 

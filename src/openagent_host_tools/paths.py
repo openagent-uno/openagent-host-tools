@@ -46,6 +46,10 @@ class HostPaths:
     def broker_authkey(self) -> Path:
         return self.internal / "broker-authkey"
 
+    @property
+    def broker_pid(self) -> Path:
+        return self.internal / "broker.pid"
+
     def ensure(self) -> None:
         self.home.mkdir(parents=True, exist_ok=True)
         self.internal.mkdir(parents=True, exist_ok=True)

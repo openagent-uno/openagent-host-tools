@@ -47,17 +47,17 @@ def test_singleton_lock_records_owner_without_contender_overwrite(tmp_path: Path
     paths = HostPaths.discover(tmp_path / "owner-marker-user")
     owner = LocalBrokerServer(paths)
     contender = LocalBrokerServer(paths)
-    lock_path = paths.internal / "broker.lock"
+    pid_path = paths.broker_pid
     try:
         owner._acquire_singleton()
-        assert lock_path.read_text(encoding="ascii") == str(os.getpid())
+        assert pid_path.read_text(encoding="ascii") == str(os.getpid())
         with pytest.raises(BrokerAlreadyRunning):
             contender._acquire_singleton()
-        assert lock_path.read_text(encoding="ascii") == str(os.getpid())
+        assert pid_path.read_text(encoding="ascii") == str(os.getpid())
     finally:
         contender._release_singleton()
         owner._release_singleton()
-    assert lock_path.read_text(encoding="ascii") == "0"
+    assert not pid_path.exists()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Unix socket variant")
