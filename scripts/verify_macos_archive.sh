@@ -99,4 +99,4 @@ sleep 1
 # the stable permission error instead of crashing, hanging, or bypassing macOS
 # privacy controls.
 "$python_bin" "$script_dir/smoke_bundle.py" "$bundle" \
-  --core-only --computer-control expect-denied
+  --core-only --computer-control expect-denied --macos-launchservices

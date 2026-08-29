@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import hashlib
 import importlib.util
 import inspect
@@ -104,6 +105,27 @@ def test_computer_control_smoke_validates_cursor_png_and_tcc_errors(tmp_path: Pa
         ).computer_control
         == "expect-granted"
     )
+    launchservices = smoke_bundle._parse_args(
+        [
+            str(tmp_path),
+            "--computer-control",
+            "expect-denied",
+            "--macos-launchservices",
+        ]
+    )
+    assert launchservices.macos_launchservices is True
+    source = inspect.getsource(smoke_bundle._computer_control)
+    assert source.index('"get_screenshot"') < source.index('"get_cursor_position"')
+    assert 'command = "/usr/bin/open"' in source
+    if sys.platform != "darwin":
+        with pytest.raises(RuntimeError, match="requires macOS and expect-denied"):
+            asyncio.run(
+                smoke_bundle._computer_control(
+                    tmp_path,
+                    "skip",
+                    macos_launchservices=True,
+                )
+            )
 
 
 def _release_archive(tmp_path: Path, *, extra_file: bool = False) -> Path:

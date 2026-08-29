@@ -185,7 +185,18 @@ def _computer_executable(bundle: Path) -> Path:
     )
 
 
-async def _computer_control(bundle: Path, mode: str) -> None:
+async def _computer_control(
+    bundle: Path,
+    mode: str,
+    *,
+    macos_launchservices: bool = False,
+) -> None:
+    if macos_launchservices and (
+        sys.platform != "darwin" or mode != "expect-denied"
+    ):
+        raise RuntimeError(
+            "--macos-launchservices requires macOS and expect-denied"
+        )
     if mode == "skip":
         return
     if mode == "expect-denied" and sys.platform != "darwin":
@@ -194,12 +205,33 @@ async def _computer_control(bundle: Path, mode: str) -> None:
     if not executable.is_file():
         raise RuntimeError(f"computer-control executable is missing: {executable}")
 
+    if macos_launchservices:
+        helper = bundle / "openagent-computer-control.app"
+        command = "/usr/bin/open"
+        command_args = [
+            "-n",
+            "-W",
+            "-g",
+            "--stdin",
+            "/dev/stdin",
+            "--stdout",
+            "/dev/stdout",
+            "--stderr",
+            "/dev/stderr",
+            "-a",
+            str(helper),
+        ]
+    else:
+        command = str(executable)
+        command_args = []
+
     # The MCP SDK intentionally starts stdio servers with a small safe
     # environment by default.  This native sidecar must inherit DISPLAY and
     # XAUTHORITY from xvfb-run (and the corresponding desktop variables on
     # other platforms) so the smoke exercises the real input/display path.
     params = StdioServerParameters(
-        command=str(executable),
+        command=command,
+        args=command_args,
         cwd=str(bundle),
         env=dict(os.environ),
     )
@@ -219,42 +251,47 @@ async def _computer_control(bundle: Path, mode: str) -> None:
                         f"{[tool.name for tool in catalog.tools]}"
                     )
 
-                cursor = await session.call_tool(
-                    "computer", {"action": "get_cursor_position"}
-                )
-                denied_at_cursor = mode == "expect-denied" and cursor.isError
-                if denied_at_cursor:
-                    _require_permission_error(cursor, "Accessibility")
-                else:
-                    _validate_cursor_result(cursor)
-                    if mode == "expect-granted":
-                        movement = await session.call_tool(
-                            "computer",
-                            {
-                                "action": "mouse_move",
-                                "coordinate": list(CONTROLLED_CURSOR_TARGET),
-                            },
-                        )
-                        if movement.isError:
-                            raise RuntimeError(
-                                "computer-control controlled mouse_move failed: "
-                                f"{_result_text(movement)}"
-                            )
-                        await asyncio.sleep(0.1)
-                        moved_cursor = await session.call_tool(
-                            "computer", {"action": "get_cursor_position"}
-                        )
-                        _require_cursor_near(
-                            _validate_cursor_result(moved_cursor),
-                            CONTROLLED_CURSOR_TARGET,
-                        )
+                if mode == "expect-denied":
+                    # Exercise both independent native permission gates.  The
+                    # screenshot probe comes first so an Accessibility denial
+                    # cannot accidentally skip the Screen Recording contract.
                     screenshot = await session.call_tool(
                         "computer", {"action": "get_screenshot"}
                     )
-                    if mode == "expect-denied":
-                        _require_permission_error(screenshot, "Screen Recording")
-                    else:
-                        _validate_screenshot_result(screenshot)
+                    _require_permission_error(screenshot, "Screen Recording")
+                    cursor = await session.call_tool(
+                        "computer", {"action": "get_cursor_position"}
+                    )
+                    _require_permission_error(cursor, "Accessibility")
+                else:
+                    cursor = await session.call_tool(
+                        "computer", {"action": "get_cursor_position"}
+                    )
+                    _validate_cursor_result(cursor)
+                    movement = await session.call_tool(
+                        "computer",
+                        {
+                            "action": "mouse_move",
+                            "coordinate": list(CONTROLLED_CURSOR_TARGET),
+                        },
+                    )
+                    if movement.isError:
+                        raise RuntimeError(
+                            "computer-control controlled mouse_move failed: "
+                            f"{_result_text(movement)}"
+                        )
+                    await asyncio.sleep(0.1)
+                    moved_cursor = await session.call_tool(
+                        "computer", {"action": "get_cursor_position"}
+                    )
+                    _require_cursor_near(
+                        _validate_cursor_result(moved_cursor),
+                        CONTROLLED_CURSOR_TARGET,
+                    )
+                    screenshot = await session.call_tool(
+                        "computer", {"action": "get_screenshot"}
+                    )
+                    _validate_screenshot_result(screenshot)
         errlog.seek(0)
         stderr = errlog.read()
     if "panicked at" in stderr or "stack backtrace" in stderr.lower():
@@ -304,9 +341,19 @@ async def _chrome(bundle: Path) -> None:
         await asyncio.sleep(1.5)
 
 
-async def _run(bundle: Path, *, core_only: bool, computer_control: str) -> None:
+async def _run(
+    bundle: Path,
+    *,
+    core_only: bool,
+    computer_control: str,
+    macos_launchservices: bool = False,
+) -> None:
     await _core(bundle)
-    await _computer_control(bundle, computer_control)
+    await _computer_control(
+        bundle,
+        computer_control,
+        macos_launchservices=macos_launchservices,
+    )
     if not core_only:
         await _chrome(bundle)
 
@@ -324,6 +371,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "success, or skip the computer-control smoke"
         ),
     )
+    parser.add_argument(
+        "--macos-launchservices",
+        action="store_true",
+        help=(
+            "launch the signed computer-control app through LaunchServices so "
+            "macOS evaluates its own TCC identity (expect-denied only)"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -334,6 +389,7 @@ def main() -> None:
             args.bundle.resolve(),
             core_only=args.core_only,
             computer_control=args.computer_control,
+            macos_launchservices=args.macos_launchservices,
         )
     )
 
