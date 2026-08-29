@@ -72,7 +72,6 @@ class BackgroundShell:
         self._signal: str | None = None
 
     async def _spawn_process(self) -> asyncio.subprocess.Process:
-        shell, flag = pick_shell()
         common = {
             "stdin": asyncio.subprocess.PIPE,
             "stdout": asyncio.subprocess.PIPE,
@@ -89,12 +88,14 @@ class BackgroundShell:
             # quote escapes, so a command such as ``python -c "..."`` is
             # reparsed incorrectly. The shell API accepts the command as an
             # already-formed command line and applies cmd.exe's outer quoting.
+            # Let CPython resolve its hardened COMSPEC default itself:
+            # explicitly forwarding ``executable`` through the Proactor
+            # transport is not equivalent across supported Windows builds.
             return await asyncio.create_subprocess_shell(
                 self.command,
-                executable=shell,
-                start_new_session=False,
                 **common,
             )
+        shell, flag = pick_shell()
         return await asyncio.create_subprocess_exec(
             shell,
             flag,

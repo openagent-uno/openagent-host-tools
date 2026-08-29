@@ -31,6 +31,11 @@ def _short_background_command() -> str:
     return subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
 
 
+def _long_background_command() -> str:
+    argv = [sys.executable, "-c", "import time; time.sleep(30)"]
+    return subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+
+
 async def _request(process, request_id: int, method: str, params: dict | None = None):
     payload = {"jsonrpc": "2.0", "id": request_id, "method": method}
     if params is not None:
@@ -171,8 +176,10 @@ async def test_official_mcp_client_validates_empty_and_nonempty_shell_lists(
             assert empty.isError is False
             assert empty.structuredContent == {"shells": []}
             started = await session.call_tool(
-                "shell_exec", {"command": "sleep 30", "run_in_background": True}
+                "shell_exec",
+                {"command": _long_background_command(), "run_in_background": True},
             )
+            assert started.isError is False, started
             shell_id = started.structuredContent["shell_id"]
             nonempty = await session.call_tool("shell_list", {})
             assert nonempty.isError is False

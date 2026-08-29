@@ -11,7 +11,6 @@ async def test_windows_shell_command_is_not_requoted_as_an_argv_element(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     command = '\"C:\\Program Files\\Python\\python.exe\" -c \"print(\'quoted value\')\"'
-    comspec = "C:\\Windows\\System32\\cmd.exe"
     sentinel = object()
     captured: dict[str, object] = {}
 
@@ -24,7 +23,6 @@ async def test_windows_shell_command_is_not_requoted_as_an_argv_element(
         raise AssertionError("Windows commands must not pass through argv quoting")
 
     monkeypatch.setattr(shell_core.platform, "system", lambda: "Windows")
-    monkeypatch.setenv("COMSPEC", comspec)
     monkeypatch.setattr(
         shell_core.asyncio,
         "create_subprocess_shell",
@@ -46,10 +44,10 @@ async def test_windows_shell_command_is_not_requoted_as_an_argv_element(
 
     assert process is sentinel
     assert captured["command"] == command
-    assert captured["executable"] == comspec
+    assert "executable" not in captured
     assert captured["cwd"] == "C:\\work tree"
     assert captured["env"]["OPENAGENT_TEST"] == "1"
-    assert captured["start_new_session"] is False
+    assert "start_new_session" not in captured
 
 
 @pytest.mark.asyncio
