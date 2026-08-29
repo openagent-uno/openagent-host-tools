@@ -23,7 +23,10 @@ def _short_background_command() -> str:
     argv = [
         sys.executable,
         "-c",
-        "import time; time.sleep(0.1); print('standalone-event')",
+        (
+            "import sys,time; time.sleep(0.1); "
+            "sys.stdout.buffer.write(b'standalone-event\\n'); sys.stdout.buffer.flush()"
+        ),
     ]
     return subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
 

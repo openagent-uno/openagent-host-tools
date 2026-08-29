@@ -73,16 +73,34 @@ class BackgroundShell:
 
     async def _spawn_process(self) -> asyncio.subprocess.Process:
         shell, flag = pick_shell()
+        common = {
+            "stdin": asyncio.subprocess.PIPE,
+            "stdout": asyncio.subprocess.PIPE,
+            "stderr": asyncio.subprocess.PIPE,
+            "cwd": self.cwd,
+            "env": {**os.environ, **(self.env or {})},
+        }
+        if platform.system().lower() == "windows":
+            # ``cmd.exe`` is not a Microsoft C-runtime argv consumer. Passing
+            # the complete command as the third argv element of
+            # ``create_subprocess_exec(cmd, "/c", command)`` makes Python run
+            # ``list2cmdline`` over it, escaping embedded quotes with
+            # backslashes. ``cmd.exe`` does not interpret those backslashes as
+            # quote escapes, so a command such as ``python -c "..."`` is
+            # reparsed incorrectly. The shell API accepts the command as an
+            # already-formed command line and applies cmd.exe's outer quoting.
+            return await asyncio.create_subprocess_shell(
+                self.command,
+                executable=shell,
+                start_new_session=False,
+                **common,
+            )
         return await asyncio.create_subprocess_exec(
             shell,
             flag,
             self.command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=self.cwd,
-            env={**os.environ, **(self.env or {})},
-            start_new_session=os.name != "nt",
+            start_new_session=True,
+            **common,
         )
 
     def _event(self, name: str, **fields) -> None:
