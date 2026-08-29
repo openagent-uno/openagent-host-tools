@@ -1,9 +1,41 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+
 import pytest
 
 from openagent_host_tools import shell_core
 from openagent_host_tools.shell_core import BackgroundShell
+
+
+@pytest.mark.skipif(os.name != "nt", reason="real Windows COMSPEC regression")
+@pytest.mark.asyncio
+async def test_windows_shell_runs_quoted_command_without_comspec(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.delenv("COMSPEC", raising=False)
+    command = subprocess.list2cmdline(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.buffer.write(b'quoted value\\n')",
+        ]
+    )
+    shell = BackgroundShell(
+        shell_id="windows-real-quoted",
+        command=command,
+        cwd=str(tmp_path),
+        env=None,
+    )
+
+    result = await shell.run_with_timeout(timeout_seconds=10)
+
+    assert result.exit_code == 0
+    assert result.stderr == ""
+    assert result.stdout == "quoted value\n"
 
 
 @pytest.mark.asyncio

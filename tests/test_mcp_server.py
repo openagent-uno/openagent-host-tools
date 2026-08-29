@@ -179,7 +179,7 @@ async def test_official_mcp_client_validates_empty_and_nonempty_shell_lists(
                 "shell_exec",
                 {"command": _long_background_command(), "run_in_background": True},
             )
-            assert started.isError is False, started
+            assert started.isError is False, started.content
             shell_id = started.structuredContent["shell_id"]
             nonempty = await session.call_tool("shell_list", {})
             assert nonempty.isError is False
