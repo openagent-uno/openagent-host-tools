@@ -32,12 +32,24 @@ class ToolManifest:
         missing, malformed, or newly-added argument values.
         """
 
-        classification = self.classification
+        matches: list[ToolClassification] = []
         for argument, values in self.classification_by_argument.items():
             value = arguments.get(argument)
             if isinstance(value, str):
-                classification = values.get(value, classification)
-        return classification
+                matched = values.get(value)
+                if matched is not None:
+                    matches.append(matched)
+        if not matches:
+            return self.classification
+        # Multiple discriminators must never become order-dependent. If a
+        # plugin declares overlapping rules, choose the most restrictive
+        # matching class so a JSON key reorder cannot make a mutation retryable.
+        risk = {
+            ToolClassification.READ_ONLY: 0,
+            ToolClassification.IDEMPOTENT: 1,
+            ToolClassification.MUTATING: 2,
+        }
+        return max(matches, key=risk.__getitem__)
 
     def to_wire(self) -> dict[str, Any]:
         value: dict[str, Any] = {

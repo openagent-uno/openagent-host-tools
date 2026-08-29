@@ -18,6 +18,7 @@ from openagent_host_tools.local_broker import (
     LocalBrokerClient,
     LocalBrokerServer,
     LocalCapabilityClient,
+    _classification_for_arguments,
     _unix_socket_path,
 )
 
@@ -28,6 +29,18 @@ async def _broker_response(client: LocalBrokerClient, request_id: str) -> dict:
         assert frame is not None
         if frame.get("id") == request_id:
             return frame
+
+
+def test_wire_argument_classification_is_conservative_and_order_independent():
+    arguments = {"first": "yes", "second": "yes"}
+    forward = {
+        "first": {"yes": "mutating"},
+        "second": {"yes": "read_only"},
+    }
+    reverse = dict(reversed(list(forward.items())))
+    assert _classification_for_arguments("read_only", forward, arguments) == "mutating"
+    assert _classification_for_arguments("read_only", reverse, arguments) == "mutating"
+    assert _classification_for_arguments("mutating", forward, {}) == "mutating"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Unix socket variant")

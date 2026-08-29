@@ -970,8 +970,14 @@ def _classification_for_arguments(
     base: str, rules: dict[str, dict[str, str]], arguments: dict[str, Any]
 ) -> str:
     classification = base if base in {"read_only", "idempotent", "mutating"} else "mutating"
+    matches: list[str] = []
     for argument, options in rules.items():
         value = arguments.get(argument)
         if isinstance(value, str):
-            classification = options.get(value, classification)
-    return classification
+            matched = options.get(value)
+            if matched is not None:
+                matches.append(matched)
+    if not matches:
+        return classification
+    risk = {"read_only": 0, "idempotent": 1, "mutating": 2}
+    return max(matches, key=risk.__getitem__)

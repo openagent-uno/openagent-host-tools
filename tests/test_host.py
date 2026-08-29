@@ -299,6 +299,33 @@ def test_computer_control_manifest_classifies_each_action_fail_closed():
     }
 
 
+def test_argument_classification_is_conservative_and_order_independent():
+    forward = ToolManifest(
+        "mixed",
+        "",
+        {},
+        ToolClassification.READ_ONLY,
+        {
+            "first": {"yes": ToolClassification.MUTATING},
+            "second": {"yes": ToolClassification.READ_ONLY},
+        },
+    )
+    reverse = ToolManifest(
+        "mixed",
+        "",
+        {},
+        ToolClassification.READ_ONLY,
+        {
+            "second": {"yes": ToolClassification.READ_ONLY},
+            "first": {"yes": ToolClassification.MUTATING},
+        },
+    )
+    arguments = {"first": "yes", "second": "yes"}
+    assert forward.classification_for(arguments) == ToolClassification.MUTATING
+    assert reverse.classification_for(arguments) == ToolClassification.MUTATING
+    assert forward.classification_for({"first": "unknown"}) == ToolClassification.READ_ONLY
+
+
 @pytest.mark.asyncio
 async def test_computer_control_read_actions_do_not_take_mutating_lease(
     paths: HostPaths, tmp_path: Path
