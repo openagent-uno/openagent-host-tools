@@ -8,6 +8,8 @@ import json
 import os
 import queue
 import secrets
+import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -31,6 +33,8 @@ class LocalBrokerServer:
         self.paths.ensure()
         self.host = CapabilityHost(paths=self.paths)
         self._lock_file = None
+        self._unix_socket: socket.socket | None = None
+        self._unix_socket_identity: tuple[int, int] | None = None
         self._unix_server: asyncio.AbstractServer | None = None
         self._windows_listener = None
         self._windows_stop = threading.Event()
@@ -48,33 +52,74 @@ class LocalBrokerServer:
         return rf"\\.\pipe\openagent-host-tools-{digest}"
 
     async def run(self) -> None:
-        self._acquire_singleton()
-        await self.host.start()
+        singleton_acquired = False
+        host_start_attempted = False
         try:
+            self._acquire_singleton()
+            singleton_acquired = True
+            if os.name != "nt":
+                self._prepare_unix_socket()
+            host_start_attempted = True
+            await self.host.start()
             if os.name == "nt":
                 await self._run_windows()
             else:
                 await self._run_unix()
         finally:
-            await self.host.close()
-            self._release_singleton()
+            try:
+                await self._close_unix_endpoint()
+            finally:
+                try:
+                    if host_start_attempted:
+                        await self.host.close()
+                finally:
+                    if singleton_acquired:
+                        self._release_singleton()
+
+    def _prepare_unix_socket(self) -> None:
+        """Claim the pathname before host startup and remember exactly what we own."""
+
+        path = self.unix_socket_path
+        _remove_stale_unix_socket(path)
+        bound = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        identity: tuple[int, int] | None = None
+        try:
+            bound.bind(str(path))
+            identity = _unix_socket_identity(path)
+            path.chmod(0o600)
+            bound.setblocking(False)
+        except BaseException:
+            bound.close()
+            _unlink_owned_unix_socket(path, identity)
+            raise
+        self._unix_socket = bound
+        self._unix_socket_identity = identity
 
     async def _run_unix(self) -> None:
-        path = self.unix_socket_path
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
-        self._unix_server = await asyncio.start_unix_server(self._handle_unix, path=str(path))
-        path.chmod(0o600)
-        try:
-            async with self._unix_server:
-                await self._unix_server.serve_forever()
-        finally:
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
+        bound = self._unix_socket
+        if bound is None:
+            raise RuntimeError("local capability socket was not prepared")
+        server = await asyncio.start_unix_server(self._handle_unix, sock=bound)
+        # asyncio owns the bound socket after a successful server creation.
+        self._unix_socket = None
+        self._unix_server = server
+        async with server:
+            await server.serve_forever()
+
+    async def _close_unix_endpoint(self) -> None:
+        server = self._unix_server
+        self._unix_server = None
+        if server is not None:
+            server.close()
+            await server.wait_closed()
+        bound = self._unix_socket
+        self._unix_socket = None
+        if bound is not None:
+            bound.close()
+        identity = self._unix_socket_identity
+        self._unix_socket_identity = None
+        if os.name != "nt":
+            _unlink_owned_unix_socket(self.unix_socket_path, identity)
 
     async def _handle_unix(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -698,6 +743,67 @@ def _load_or_create_authkey(paths: HostPaths) -> bytes:
     finally:
         os.close(fd)
     return data
+
+
+def _unix_socket_identity(path: Path) -> tuple[int, int]:
+    metadata = path.lstat()
+    if not stat.S_ISSOCK(metadata.st_mode):
+        raise RuntimeError(f"refusing to use non-socket broker endpoint at {path}")
+    return metadata.st_dev, metadata.st_ino
+
+
+def _remove_stale_unix_socket(path: Path) -> None:
+    """Remove one dead endpoint, preserving anything active or replaced.
+
+    The per-home singleton lock is already held when this runs. The connection
+    probe protects an independently managed live endpoint at the same pathname,
+    while the inode check prevents deleting a file swapped in after the probe.
+    """
+
+    try:
+        identity = _unix_socket_identity(path)
+    except FileNotFoundError:
+        return
+
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(0.2)
+    try:
+        probe.connect(str(path))
+    except (ConnectionRefusedError, FileNotFoundError):
+        pass
+    except OSError as exc:
+        raise BrokerAlreadyRunning(
+            f"refusing to replace an unverified local capability socket at {path}"
+        ) from exc
+    else:
+        raise BrokerAlreadyRunning(
+            f"local capability socket is already accepting connections at {path}"
+        )
+    finally:
+        probe.close()
+
+    _unlink_owned_unix_socket(path, identity, strict=True)
+
+
+def _unlink_owned_unix_socket(
+    path: Path,
+    identity: tuple[int, int] | None,
+    *,
+    strict: bool = False,
+) -> bool:
+    if identity is None:
+        return False
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    current = (metadata.st_dev, metadata.st_ino)
+    if not stat.S_ISSOCK(metadata.st_mode) or current != identity:
+        if strict:
+            raise RuntimeError(f"broker endpoint changed before stale cleanup: {path}")
+        return False
+    path.unlink()
+    return True
 
 
 def _unix_socket_path(paths: HostPaths) -> Path:

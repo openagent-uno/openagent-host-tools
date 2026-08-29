@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import shlex
+import socket
 import sys
 import time
 from pathlib import Path
@@ -12,6 +13,7 @@ import pytest
 
 from openagent_host_tools import HostError, HostPaths
 from openagent_host_tools.local_broker import (
+    BrokerAlreadyRunning,
     LocalBrokerClient,
     LocalBrokerServer,
     LocalCapabilityClient,
@@ -99,6 +101,174 @@ async def test_single_instance_broker_vertical_slice(tmp_path: Path):
         await client.close()
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+    assert not server.unix_socket_path.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix socket variant")
+@pytest.mark.asyncio
+async def test_sigterm_gracefully_removes_broker_socket(tmp_path: Path):
+    paths = HostPaths.discover(tmp_path / "user")
+    socket_path = _unix_socket_path(paths)
+    env = os.environ.copy()
+    env["OPENAGENT_HOST_TOOLS_HOME"] = str(paths.home)
+    broker = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-m",
+        "openagent_host_tools",
+        "--broker",
+        env=env,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        for _ in range(200):
+            if socket_path.exists():
+                break
+            if broker.returncode is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert socket_path.exists()
+
+        broker.terminate()
+        await asyncio.wait_for(broker.wait(), timeout=3)
+
+        assert broker.returncode == 0
+        assert not socket_path.exists()
+    finally:
+        if broker.returncode is None:
+            broker.kill()
+            await broker.wait()
+        socket_path.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_failed_host_start_releases_singleton_and_endpoint(tmp_path: Path):
+    class FailingHost:
+        def __init__(self) -> None:
+            self.close_count = 0
+
+        async def start(self) -> None:
+            raise RuntimeError("host startup failed")
+
+        async def close(self) -> None:
+            self.close_count += 1
+
+    paths = HostPaths.discover(tmp_path / "user")
+    server = LocalBrokerServer(paths)
+    failing_host = FailingHost()
+    server.host = failing_host  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError, match="host startup failed"):
+        await server.run()
+
+    assert failing_host.close_count == 1
+    if os.name != "nt":
+        assert not server.unix_socket_path.exists()
+
+    # A failed startup must not poison this user's singleton lock.
+    replacement = LocalBrokerServer(paths)
+    replacement._acquire_singleton()
+    replacement._release_singleton()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix socket variant")
+@pytest.mark.asyncio
+async def test_stale_socket_is_replaced_and_removed_on_close(tmp_path: Path):
+    paths = HostPaths.discover(tmp_path / "user")
+    socket_path = _unix_socket_path(paths)
+    stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stale.bind(str(socket_path))
+    stale.close()
+    assert socket_path.exists()
+
+    server = LocalBrokerServer(paths)
+    task = asyncio.create_task(server.run())
+    client = LocalBrokerClient(paths)
+    try:
+        for _ in range(200):
+            try:
+                await client.connect()
+                break
+            except (OSError, EOFError, ConnectionRefusedError, FileNotFoundError):
+                await client.close()
+                await asyncio.sleep(0.01)
+        assert client._writer is not None
+    finally:
+        await client.close()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert not socket_path.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix socket variant")
+@pytest.mark.asyncio
+async def test_active_unrelated_socket_is_never_unlinked(tmp_path: Path):
+    paths = HostPaths.discover(tmp_path / "user")
+    socket_path = _unix_socket_path(paths)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(8)
+    original = socket_path.stat()
+    server = LocalBrokerServer(paths)
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        with pytest.raises(BrokerAlreadyRunning, match="socket"):
+            await server.run()
+
+        current = socket_path.stat()
+        assert (current.st_dev, current.st_ino) == (original.st_dev, original.st_ino)
+        probe.connect(str(socket_path))
+    finally:
+        probe.close()
+        listener.close()
+        socket_path.unlink(missing_ok=True)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix socket variant")
+@pytest.mark.asyncio
+async def test_shutdown_preserves_replacement_socket(tmp_path: Path):
+    paths = HostPaths.discover(tmp_path / "user")
+    socket_path = _unix_socket_path(paths)
+    server = LocalBrokerServer(paths)
+    task = asyncio.create_task(server.run())
+    client = LocalBrokerClient(paths)
+    replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        for _ in range(200):
+            try:
+                await client.connect()
+                break
+            except (OSError, EOFError, ConnectionRefusedError, FileNotFoundError):
+                await client.close()
+                await asyncio.sleep(0.01)
+        assert client._writer is not None
+        await client.close()
+
+        # Simulate another owner replacing the pathname while this broker's
+        # already-open server socket is winding down. Cleanup may only unlink
+        # the inode originally bound by this LocalBrokerServer instance.
+        socket_path.unlink()
+        replacement.bind(str(socket_path))
+        replacement.listen(8)
+        original = socket_path.stat()
+
+        task.cancel()
+        results = await asyncio.gather(task, return_exceptions=True)
+        assert isinstance(results[0], asyncio.CancelledError)
+        current = socket_path.stat()
+        assert (current.st_dev, current.st_ino) == (original.st_dev, original.st_ino)
+        probe.connect(str(socket_path))
+    finally:
+        await client.close()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        probe.close()
+        replacement.close()
+        socket_path.unlink(missing_ok=True)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Unix socket variant")

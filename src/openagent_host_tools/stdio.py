@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -262,6 +263,46 @@ def _write_stdout(data: str) -> None:
     sys.stdout.flush()
 
 
+async def _run_broker_until_signal() -> None:
+    """Turn Unix termination into cancellation so endpoint cleanup can run."""
+
+    server_task = asyncio.create_task(
+        LocalBrokerServer().run(), name="openagent-host-tools-broker"
+    )
+    if os.name == "nt":  # named pipes and locks are reclaimed by the kernel
+        await server_task
+        return
+
+    loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
+    installed: list[signal.Signals] = []
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(signum, stop.set)
+        except (NotImplementedError, RuntimeError, ValueError):
+            continue
+        installed.append(signum)
+    if not installed:
+        await server_task
+        return
+
+    stop_task = asyncio.create_task(stop.wait(), name="host-tools-signal-wait")
+    try:
+        done, _pending = await asyncio.wait(
+            {server_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if server_task in done:
+            await server_task
+        else:
+            server_task.cancel()
+            await asyncio.gather(server_task, return_exceptions=True)
+    finally:
+        stop_task.cancel()
+        await asyncio.gather(stop_task, return_exceptions=True)
+        for signum in installed:
+            loop.remove_signal_handler(signum)
+
+
 async def _async_main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="openagent-host-tools")
     parser.add_argument("--broker", action="store_true", help=argparse.SUPPRESS)
@@ -276,7 +317,7 @@ async def _async_main(argv: list[str] | None = None) -> None:
         await serve(args.mcp)
     elif args.broker:
         try:
-            await LocalBrokerServer().run()
+            await _run_broker_until_signal()
         except BrokerAlreadyRunning:
             return
     elif args.direct:
