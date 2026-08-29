@@ -1,9 +1,16 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact full commit to release
+        required: true
+        type: string
+      release_tag:
+        description: Immutable release tag (for example v0.1.0)
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -13,6 +20,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -20,13 +30,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "${GITHUB_REF_NAME}" = "v$(python -c 'import runpy; print(runpy.run_path("src/openagent_host_tools/_version.py")["__version__"])')"
+          test "$(git rev-parse HEAD)" = "${{ inputs.source_ref }}"
+          test "${{ inputs.release_tag }}" = "v$(python -c 'import runpy; print(runpy.run_path("src/openagent_host_tools/_version.py")["__version__"])')"
       - name: Test twice and build universal wheel
         run: |
           python -m pip install -e ".[dev]" build
           pytest -q
           pytest -q
           python -m build --wheel
+          version="$(python -c 'import runpy; print(runpy.run_path("src/openagent_host_tools/_version.py")["__version__"])')"
+          python -m venv "$RUNNER_TEMP/wheel-smoke"
+          "$RUNNER_TEMP/wheel-smoke/bin/pip" install --no-cache-dir dist/*.whl
+          "$RUNNER_TEMP/wheel-smoke/bin/python" -c \
+            "import openagent_host_tools as h; assert h.__version__ == '$version'"
+          "$RUNNER_TEMP/wheel-smoke/bin/openagent-host-tools" --help >/dev/null
       - name: Wheel checksum
         shell: bash
         run: |
@@ -60,6 +77,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -74,7 +94,8 @@ jobs:
           sudo apt-get install -y \
             libxdo-dev libx11-dev libxtst-dev libxi-dev libxrandr-dev \
             libwayland-dev libxkbcommon-dev libpipewire-0.3-dev libdbus-1-dev \
-            libegl1-mesa-dev libgl1-mesa-dev libgbm-dev pkg-config
+            libegl1-mesa-dev libgl1-mesa-dev libgbm-dev pkg-config \
+            xvfb xauth
       - name: Install build dependencies
         run: python -m pip install -e ".[dev]" pyinstaller
       - name: Build self-contained native bundle
@@ -87,59 +108,34 @@ jobs:
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          set -euo pipefail
-          test -n "${CSC_LINK:-}" || { echo "CSC_LINK is required for a macOS release"; exit 1; }
-          test -n "${APPLE_ID:-}" || { echo "APPLE_ID is required for notarization"; exit 1; }
-          test -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" || { echo "APPLE_APP_SPECIFIC_PASSWORD is required for notarization"; exit 1; }
-          expected_team="B4KWCQFY8V"
-          keychain="$RUNNER_TEMP/host-tools-sign.keychain"
-          password="$(openssl rand -hex 16)"
-          security create-keychain -p "$password" "$keychain"
-          security unlock-keychain -p "$password" "$keychain"
-          security set-keychain-settings -lut 3600 "$keychain"
-          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
-          p12="$RUNNER_TEMP/host-tools-sign.p12"
-          echo "$CSC_LINK" | base64 --decode > "$p12"
-          security import "$p12" -k "$keychain" -P "$CSC_KEY_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain"
-          identity="$(security find-identity -v -p codesigning "$keychain" | awk -F'"' '/Developer ID Application/ {print $2; exit}')"
-          test -n "$identity"
           bundle="dist/${{ matrix.platform }}"
-          codesign --force --sign "$identity" --identifier com.openagent.host-tools.node --options runtime --timestamp --entitlements scripts/entitlements-node.plist "$bundle/node"
-          codesign --force --sign "$identity" --identifier com.openagent.host-tools --options runtime --timestamp --entitlements scripts/entitlements-host.plist "$bundle/openagent-host-tools"
-          codesign --force --sign "$identity" --identifier com.openagent.computer-control --options runtime --timestamp "$bundle/openagent-computer-control.app/Contents/MacOS/openagent-computer-control"
-          codesign --force --sign "$identity" --identifier com.openagent.computer-control --options runtime --timestamp "$bundle/openagent-computer-control.app"
-          codesign --verify --deep --strict --verbose=2 "$bundle/openagent-computer-control.app"
-          codesign --verify --strict --verbose=2 "$bundle/openagent-host-tools"
-          for target in "$bundle/node" "$bundle/openagent-host-tools" "$bundle/openagent-computer-control.app"; do
-            actual_team="$(codesign -d --verbose=4 "$target" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
-            test "$actual_team" = "$expected_team" || { echo "unexpected TeamIdentifier $actual_team for $target"; exit 1; }
-          done
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$bundle/openagent-computer-control.app/Contents/Info.plist")" = "com.openagent.computer-control"
-          "$bundle/node" -e "process.stdout.write('node-ok')" | grep -qx node-ok
-          notary_zip="$RUNNER_TEMP/openagent-host-tools-${{ matrix.platform }}.zip"
-          ditto -c -k --keepParent "$bundle" "$notary_zip"
-          xcrun notarytool submit "$notary_zip" \
-            --apple-id "$APPLE_ID" \
-            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-            --team-id "$expected_team" \
-            --wait
-          xcrun stapler staple "$bundle/openagent-computer-control.app"
-          xcrun stapler validate "$bundle/openagent-computer-control.app"
-          spctl --assess --type execute --verbose=4 "$bundle/openagent-computer-control.app"
-          spctl --assess --type execute --verbose=4 "$bundle/openagent-host-tools"
+          scripts/sign_macos_bundle.sh "$bundle"
           python scripts/build_standalone.py --manifest-only --expect-platform ${{ matrix.platform }}
       - name: Verify live sidecar catalogs match the version lock
         run: python scripts/snapshot_sidecar_manifests.py dist/${{ matrix.platform }} --check
       - name: Smoke signed frozen MCP and browser runtime
         if: runner.os == 'macOS'
-        run: python scripts/smoke_bundle.py dist/${{ matrix.platform }}
+        run: python scripts/smoke_bundle.py dist/${{ matrix.platform }} --computer-control expect-denied
+      - name: Smoke frozen core and computer-control under Xvfb
+        if: runner.os == 'Linux'
+        shell: bash
+        run: >-
+          xvfb-run -a -s '-screen 0 1280x1024x24'
+          python scripts/smoke_bundle.py dist/${{ matrix.platform }}
+          --core-only --computer-control expect-granted
       - name: Smoke frozen core MCP runtime
-        if: runner.os != 'macOS'
-        run: python scripts/smoke_bundle.py dist/${{ matrix.platform }} --core-only
+        if: runner.os == 'Windows'
+        run: python scripts/smoke_bundle.py dist/${{ matrix.platform }} --core-only --computer-control skip
       - name: Package and checksum
         run: python scripts/package_bundle.py dist/${{ matrix.platform }}
+      - name: Verify final macOS archive after extraction
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: scripts/verify_macos_archive.sh dist/openagent-host-tools-${{ matrix.platform }}.tar.gz
       - uses: actions/upload-artifact@v4
         with:
           name: bundle-${{ matrix.platform }}
@@ -149,10 +145,13 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [test-wheel, native-bundle, publish-pypi]
+    needs: [test-wheel, native-bundle]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -164,9 +163,11 @@ jobs:
           cd artifacts
           for checksum in *.sha256; do sha256sum --check "$checksum"; done
       - name: Generate cross-client immutable release index
-        run: python scripts/release_index.py artifacts --source-commit "$GITHUB_SHA" --source-repository "$GITHUB_REPOSITORY"
+        run: python scripts/release_index.py artifacts --source-commit "${{ inputs.source_ref }}" --source-repository "$GITHUB_REPOSITORY"
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.release_tag }}
+          target_commitish: ${{ inputs.source_ref }}
           generate_release_notes: true
           files: |
             artifacts/*.whl
@@ -174,46 +175,3 @@ jobs:
             artifacts/*.zip
             artifacts/*.sha256
             artifacts/release-index.json
-
-  publish-pypi:
-    needs: [test-wheel, native-bundle]
-    runs-on: ubuntu-24.04
-    environment:
-      name: pypi
-      url: https://pypi.org/p/openagent-host-tools
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - uses: actions/download-artifact@v4
-        with:
-          name: wheel
-          path: dist
-      - name: Verify wheel checksum
-        shell: bash
-        run: |
-          cd dist
-          sha256sum --check openagent-host-tools-wheel.sha256
-          rm openagent-host-tools-wheel.sha256
-      - name: Publish immutable wheel with PyPI trusted publishing
-        uses: pypa/gh-action-pypi-publish@release/v1
-      - name: Verify a clean install from PyPI
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="$(python -c 'import runpy; print(runpy.run_path("src/openagent_host_tools/_version.py")["__version__"])')"
-          python -m venv "$RUNNER_TEMP/pypi-smoke"
-          for attempt in 1 2 3 4 5 6; do
-            if "$RUNNER_TEMP/pypi-smoke/bin/pip" install --no-cache-dir "openagent-host-tools==$version"; then
-              break
-            fi
-            test "$attempt" != 6
-            sleep 10
-          done
-          "$RUNNER_TEMP/pypi-smoke/bin/python" -c \
-            "import openagent_host_tools as h; assert h.__version__ == '$version'"
-          "$RUNNER_TEMP/pypi-smoke/bin/openagent-host-tools" --help >/dev/null

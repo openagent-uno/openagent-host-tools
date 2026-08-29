@@ -5,7 +5,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
   apple-credentials:
@@ -29,18 +28,3 @@ jobs:
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" >/dev/null
           echo "Apple signing/notary credentials are available"
-
-  oidc:
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Verify GitHub can mint a trusted-publishing identity token
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
-          test -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
-          curl --fail --silent --show-error \
-            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=pypi" \
-            | python -c 'import json,sys; assert json.load(sys.stdin).get("value")'
-          echo "GitHub OIDC token minting is available; PyPI still validates publisher binding at upload"

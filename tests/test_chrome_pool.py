@@ -139,7 +139,7 @@ process.stdout.write(JSON.stringify(result));
         thread.join(timeout=5)
 
 
-def test_chromium_snapshot_fallback_never_uses_nonexistent_arm_archives():
+def test_browser_runtime_has_no_mutable_snapshot_download_path():
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is required to inspect the browser runtime")
@@ -150,18 +150,25 @@ def test_chromium_snapshot_fallback_never_uses_nonexistent_arm_archives():
         / "host"
         / "browser.js"
     )
+    source = browser_js.read_text()
+    forbidden = (
+        "LAST_CHANGE",
+        "chromium-browser-snapshots",
+        "downloadChromium",
+        "cachedChromiumBinary",
+        "CHROMIUM_DIR",
+        "No working browser found — downloading Chromium",
+    )
+    for marker in forbidden:
+        assert marker not in source, f"mutable browser download path remains: {marker}"
+
     script = r'''
 import { pathToFileURL } from "node:url";
 const browser = await import(pathToFileURL(process.argv[1]).href);
 const result = {
-  linuxX64: browser.chromiumSnapshotSpec("linux", "x64"),
-  winX64: browser.chromiumSnapshotSpec("win32", "x64"),
-  errors: [],
+  snapshotSpecExported: typeof browser.chromiumSnapshotSpec !== "undefined",
+  downloadExported: typeof browser.downloadChromium !== "undefined",
 };
-for (const [system, arch] of [["linux", "arm64"], ["win32", "arm64"]]) {
-  try { browser.chromiumSnapshotSpec(system, arch); }
-  catch (error) { result.errors.push(String(error.message)); }
-}
 process.stdout.write(JSON.stringify(result));
 '''
     completed = subprocess.run(
@@ -172,17 +179,137 @@ process.stdout.write(JSON.stringify(result));
         timeout=10,
     )
     result = json.loads(completed.stdout)
-    assert result["linuxX64"] == {
-        "archPath": "Linux_x64",
-        "archiveName": "chrome-linux.zip",
-    }
-    assert result["winX64"] == {
-        "archPath": "Win_x64",
-        "archiveName": "chrome-win.zip",
-    }
-    assert len(result["errors"]) == 2
-    assert all("OPENAGENT_CHROME_BINARY" in message for message in result["errors"])
-    assert all("Win_Arm" not in message for message in result["errors"])
+    assert result == {"snapshotSpecExported": False, "downloadExported": False}
+
+
+def test_crx3_verification_accepts_valid_signature_and_rejects_tampering():
+    """Build and authenticate a real CRX3 container entirely in Node.
+
+    The fixture is generated from a fresh RSA key, not a mocked verifier: its
+    extension id is derived from the SPKI, and its signature covers the exact
+    CRX3 context string, signed header and ZIP payload.  Flipping one payload
+    byte or requesting another id must fail closed.
+    """
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required to exercise CRX3 signature verification")
+    browser_js = (
+        Path(__file__).parents[1]
+        / "sidecars"
+        / "agent-in-chrome"
+        / "host"
+        / "browser.js"
+    )
+    script = r'''
+import crypto from "node:crypto";
+import { pathToFileURL } from "node:url";
+
+const browser = await import(pathToFileURL(process.argv[1]).href);
+
+function varint(input) {
+  let value = BigInt(input);
+  const out = [];
+  do {
+    let byte = Number(value & 0x7fn);
+    value >>= 7n;
+    if (value) byte |= 0x80;
+    out.push(byte);
+  } while (value);
+  return Buffer.from(out);
+}
+
+function bytesField(number, value) {
+  const data = Buffer.from(value);
+  return Buffer.concat([varint(number * 8 + 2), varint(data.length), data]);
+}
+
+function extensionId(publicKey) {
+  const digest = crypto.createHash("sha256").update(publicKey).digest().subarray(0, 16);
+  let id = "";
+  for (const byte of digest) id += String.fromCharCode(97 + (byte >> 4), 97 + (byte & 15));
+  return id;
+}
+
+const { publicKey, privateKey } = crypto.generateKeyPairSync("rsa", {
+  modulusLength: 2048,
+  publicExponent: 0x10001,
+});
+const spki = publicKey.export({ type: "spki", format: "der" });
+const id = extensionId(spki);
+const rawId = crypto.createHash("sha256").update(spki).digest().subarray(0, 16);
+const signedHeader = bytesField(1, rawId);
+// It only needs to be a deterministic ZIP-shaped byte sequence for this
+// verifier test; extraction happens strictly after authentication.
+const zip = Buffer.from("504b03041400000000000000000000000000000000000000000000", "hex");
+const signedHeaderSize = Buffer.alloc(4);
+signedHeaderSize.writeUInt32LE(signedHeader.length);
+const signedPayload = Buffer.concat([
+  Buffer.from("CRX3 SignedData\0", "ascii"),
+  signedHeaderSize,
+  signedHeader,
+  zip,
+]);
+const signature = crypto.sign("sha256", signedPayload, {
+  key: privateKey,
+  padding: crypto.constants.RSA_PKCS1_PADDING,
+});
+const proof = Buffer.concat([bytesField(1, spki), bytesField(2, signature)]);
+const header = Buffer.concat([bytesField(2, proof), bytesField(10000, signedHeader)]);
+const prefix = Buffer.alloc(12);
+prefix.write("Cr24", 0, "latin1");
+prefix.writeUInt32LE(3, 4);
+prefix.writeUInt32LE(header.length, 8);
+const crx = Buffer.concat([prefix, header, zip]);
+
+// A mathematically valid RSA signature mislabeled as ECDSA must not be
+// accepted merely because Node can infer the algorithm from its SPKI.
+const wrongAlgorithmHeader = Buffer.concat([
+  bytesField(3, proof),
+  bytesField(10000, signedHeader),
+]);
+const wrongAlgorithmPrefix = Buffer.alloc(12);
+wrongAlgorithmPrefix.write("Cr24", 0, "latin1");
+wrongAlgorithmPrefix.writeUInt32LE(3, 4);
+wrongAlgorithmPrefix.writeUInt32LE(wrongAlgorithmHeader.length, 8);
+const wrongAlgorithmCrx = Buffer.concat([wrongAlgorithmPrefix, wrongAlgorithmHeader, zip]);
+
+const validOffset = browser.verifyCrx3Package(crx, id);
+const tampered = Buffer.from(crx);
+tampered[tampered.length - 1] ^= 0x01;
+const wrongId = id.slice(0, -1) + (id.endsWith("a") ? "b" : "a");
+
+function rejected(fn) {
+  try {
+    fn();
+    return null;
+  } catch (error) {
+    return String(error.message);
+  }
+}
+
+process.stdout.write(JSON.stringify({
+  validOffset,
+  expectedOffset: crx.length - zip.length,
+  tamperError: rejected(() => browser.verifyCrx3Package(tampered, id)),
+  wrongIdError: rejected(() => browser.verifyCrx3Package(crx, wrongId)),
+  wrongAlgorithmError: rejected(() => browser.verifyCrx3Package(wrongAlgorithmCrx, id)),
+  invalidIdError: rejected(() => browser.verifyCrx3Package(crx, "not-an-extension-id")),
+}));
+'''
+    completed = subprocess.run(
+        [node, "--input-type=module", "--eval", script, str(browser_js)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    result = json.loads(completed.stdout)
+    assert result["validOffset"] == result["expectedOffset"]
+    assert "signature verification failed" in result["tamperError"]
+    assert "signed extension id does not match" in result["wrongIdError"]
+    assert "signature verification failed" in result["wrongAlgorithmError"]
+    assert "invalid Chrome Web Store extension id" in result["invalidIdError"]
 
 
 @pytest.mark.asyncio
