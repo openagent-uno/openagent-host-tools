@@ -23,6 +23,28 @@ COMPUTER_CONTROL_MODES = ("expect-denied", "expect-granted", "skip")
 CONTROLLED_CURSOR_TARGET = (64, 64)
 CURSOR_TOLERANCE = 2
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+CHROME_SMOKE_MARKER = "OPENAGENT_CHROME_RELEASE_SMOKE"
+CHROME_SMOKE_MUTATED_MARKER = f"{CHROME_SMOKE_MARKER}_MUTATED"
+EXPECTED_CHROME_TOOLS = (
+    "tabs_context_mcp",
+    "tabs_create_mcp",
+    "navigate",
+    "computer",
+    "find",
+    "form_input",
+    "get_page_text",
+    "read_page",
+    "javascript_tool",
+    "read_console_messages",
+    "read_network_requests",
+    "resize_window",
+    "upload_image",
+    "list_extensions",
+    "install_extension",
+    "remove_extension",
+)
+SHELL_COMPLETION_CAPABILITY = "openagent/shell-completion"
+SHELL_COMPLETION_LOGGER = "openagent.shell"
 
 
 def _result_text(result: object) -> str:
@@ -137,6 +159,49 @@ def _validate_png(payload: bytes) -> None:
         raise RuntimeError("computer-control returned an empty PNG image")
 
 
+def _tab_id_from_context(result: object) -> int:
+    if getattr(result, "isError", False):
+        raise RuntimeError(f"Agent-in-Chrome tab discovery failed: {_result_text(result)}")
+    first_line = ""
+    try:
+        first_line = _result_text(result).splitlines()[0]
+        payload = json.loads(first_line)
+        tabs = payload["availableTabs"]
+        tab_id = tabs[0]["tabId"]
+    except (IndexError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Agent-in-Chrome returned an invalid tab context: {first_line!r}"
+        ) from exc
+    if not isinstance(tab_id, int) or isinstance(tab_id, bool):
+        raise RuntimeError(f"Agent-in-Chrome returned a non-integer tab id: {tab_id!r}")
+    return tab_id
+
+
+async def _chrome_smoke_page(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    try:
+        await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
+        body = (
+            "<!doctype html><meta charset=utf-8><title>OpenAgent release smoke</title>"
+            f'<main id="marker">{CHROME_SMOKE_MARKER}</main>'
+        ).encode()
+        writer.write(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/html; charset=utf-8\r\n"
+            + f"Content-Length: {len(body)}\r\n".encode()
+            + b"Connection: close\r\n\r\n"
+            + body
+        )
+        await writer.drain()
+    except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, TimeoutError):
+        pass
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except ConnectionError:
+            pass
+
+
 async def _core(bundle: Path) -> None:
     executable = bundle / (
         "openagent-host-tools.exe" if os.name == "nt" else "openagent-host-tools"
@@ -152,9 +217,19 @@ async def _core(bundle: Path) -> None:
             args=["--mcp", server],
             cwd=str(bundle),
         )
+        shell_events: asyncio.Queue[dict] = asyncio.Queue()
+
+        async def logging_callback(params: object) -> None:
+            if getattr(params, "logger", None) == SHELL_COMPLETION_LOGGER:
+                shell_events.put_nowait(getattr(params, "data"))
+
         with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as errlog:
             async with stdio_client(params, errlog=errlog) as (reader, writer):
-                async with ClientSession(reader, writer) as session:
+                async with ClientSession(
+                    reader,
+                    writer,
+                    logging_callback=logging_callback if server == "shell" else None,
+                ) as session:
                     initialized = await session.initialize()
                     if initialized.serverInfo.name != server:
                         raise RuntimeError(
@@ -163,6 +238,39 @@ async def _core(bundle: Path) -> None:
                     result = await session.call_tool(tool, arguments)
                     if result.isError:
                         raise RuntimeError(f"{server}.{tool} failed: {result.content}")
+                    if server == "shell":
+                        experimental = initialized.capabilities.experimental or {}
+                        completion = experimental.get(SHELL_COMPLETION_CAPABILITY)
+                        if (
+                            initialized.capabilities.logging is None
+                            or completion is None
+                            or completion.get("logger") != SHELL_COMPLETION_LOGGER
+                        ):
+                            raise RuntimeError(
+                                "frozen shell did not advertise its completion notification contract"
+                            )
+                        started = await session.call_tool(
+                            "shell_exec",
+                            {
+                                "command": "echo openagent-shell-smoke",
+                                "run_in_background": True,
+                            },
+                        )
+                        if started.isError or started.structuredContent is None:
+                            raise RuntimeError(
+                                f"frozen shell background start failed: {started.content}"
+                            )
+                        event = await asyncio.wait_for(shell_events.get(), timeout=10)
+                        if (
+                            event.get("type") != "shell_completed"
+                            or event.get("shell_id") != started.structuredContent.get("shell_id")
+                            or event.get("status") != "completed"
+                            or event.get("exit_code") != 0
+                            or event.get("output_bytes", 0) <= 0
+                        ):
+                            raise RuntimeError(
+                                f"frozen shell emitted an invalid completion event: {event}"
+                            )
             errlog.seek(0)
             stderr = errlog.read()
         if "Traceback" in stderr or "I/O operation on closed file" in stderr:
@@ -179,9 +287,7 @@ def _computer_executable(bundle: Path) -> Path:
             / "openagent-computer-control"
         )
     return bundle / (
-        "openagent-computer-control.exe"
-        if os.name == "nt"
-        else "openagent-computer-control"
+        "openagent-computer-control.exe" if os.name == "nt" else "openagent-computer-control"
     )
 
 
@@ -191,12 +297,8 @@ async def _computer_control(
     *,
     macos_launchservices: bool = False,
 ) -> None:
-    if macos_launchservices and (
-        sys.platform != "darwin" or mode != "expect-denied"
-    ):
-        raise RuntimeError(
-            "--macos-launchservices requires macOS and expect-denied"
-        )
+    if macos_launchservices and (sys.platform != "darwin" or mode != "expect-denied"):
+        raise RuntimeError("--macos-launchservices requires macOS and expect-denied")
     if mode == "skip":
         return
     if mode == "expect-denied" and sys.platform != "darwin":
@@ -307,44 +409,91 @@ async def _computer_control(
 async def _chrome(bundle: Path) -> None:
     node = bundle / ("node.exe" if os.name == "nt" else "node")
     script = bundle / "agent-in-chrome" / "host" / "mcp-server.js"
-    with tempfile.TemporaryDirectory(prefix="openagent-chrome-smoke-") as temporary:
-        root = Path(temporary)
-        with socket.socket() as reservation:
-            reservation.bind(("127.0.0.1", 0))
-            cdp_port = reservation.getsockname()[1]
-        params = StdioServerParameters(
-            command=str(node),
-            args=[str(script)],
-            env={
-                **os.environ,
-                "OPENAGENT_CHROME_PROFILE_DIR": str(root / "profile"),
-                "OPENAGENT_CHROME_EXTENSIONS_DIR": str(root / "extensions"),
-                "OPENAGENT_CHROME_CDP_PORT": str(cdp_port),
-            },
-        )
-        with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as errlog:
-            async with stdio_client(params, errlog=errlog) as (reader, writer):
-                async with ClientSession(reader, writer) as session:
-                    initialized = await session.initialize()
-                    if initialized.serverInfo.name != "agent-in-chrome":
-                        raise RuntimeError(
-                            f"unexpected Agent-in-Chrome identity: {initialized.serverInfo.name}"
+    if not node.is_file() or not script.is_file():
+        raise RuntimeError(f"Agent-in-Chrome bundle is incomplete: node={node}, script={script}")
+    page_server = await asyncio.start_server(_chrome_smoke_page, "127.0.0.1", 0)
+    page_port = page_server.sockets[0].getsockname()[1]
+    try:
+        with tempfile.TemporaryDirectory(prefix="openagent-chrome-smoke-") as temporary:
+            root = Path(temporary)
+            with socket.socket() as reservation:
+                reservation.bind(("127.0.0.1", 0))
+                cdp_port = reservation.getsockname()[1]
+            params = StdioServerParameters(
+                command=str(node),
+                args=[str(script)],
+                env={
+                    **os.environ,
+                    "OPENAGENT_CHROME_PROFILE_DIR": str(root / "profile"),
+                    "OPENAGENT_CHROME_EXTENSIONS_DIR": str(root / "extensions"),
+                    "OPENAGENT_CHROME_CDP_PORT": str(cdp_port),
+                },
+            )
+            with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as errlog:
+                async with stdio_client(params, errlog=errlog) as (reader, writer):
+                    async with ClientSession(reader, writer) as session:
+                        initialized = await session.initialize()
+                        if initialized.serverInfo.name != "agent-in-chrome":
+                            raise RuntimeError(
+                                "unexpected Agent-in-Chrome identity: "
+                                f"{initialized.serverInfo.name}"
+                            )
+                        catalog = await session.list_tools()
+                        names = tuple(tool.name for tool in catalog.tools)
+                        if names != EXPECTED_CHROME_TOOLS:
+                            raise RuntimeError(f"unexpected Agent-in-Chrome tool catalog: {names}")
+                        context = await session.call_tool(
+                            "tabs_context_mcp", {"createIfEmpty": True}
                         )
-                    result = await session.call_tool("list_extensions", {})
-                    if result.isError:
-                        raise RuntimeError(f"agent-in-chrome smoke failed: {result.content}")
-                    invalid = await session.call_tool(
-                        "upload_image", {"imageId": "missing", "tabId": 1}
-                    )
-                    if not invalid.isError:
-                        raise RuntimeError("Agent-in-Chrome runtime errors must set isError")
-            errlog.seek(0)
-            stderr = errlog.read()
-            if "Traceback" in stderr:
-                raise RuntimeError(f"agent-in-chrome emitted a traceback: {stderr}")
-        # The sidecar owns a detached Chromium process group. Give its SIGTERM
-        # handler time to release the profile before removing the temporary dir.
-        await asyncio.sleep(1.5)
+                        tab_id = _tab_id_from_context(context)
+                        navigated = await session.call_tool(
+                            "navigate",
+                            {
+                                "url": f"http://127.0.0.1:{page_port}/smoke",
+                                "tabId": tab_id,
+                            },
+                        )
+                        if navigated.isError:
+                            raise RuntimeError(
+                                f"Agent-in-Chrome navigation failed: {_result_text(navigated)}"
+                            )
+                        initial = await session.call_tool("get_page_text", {"tabId": tab_id})
+                        if initial.isError or CHROME_SMOKE_MARKER not in _result_text(initial):
+                            raise RuntimeError(
+                                "Agent-in-Chrome did not read the deterministic smoke page: "
+                                f"{_result_text(initial)}"
+                            )
+                        mutated = await session.call_tool(
+                            "javascript_tool",
+                            {
+                                "action": "javascript_exec",
+                                "text": (
+                                    "document.querySelector('#marker').textContent = "
+                                    f"{json.dumps(CHROME_SMOKE_MUTATED_MARKER)}"
+                                ),
+                                "tabId": tab_id,
+                            },
+                        )
+                        if mutated.isError:
+                            raise RuntimeError(
+                                f"Agent-in-Chrome page interaction failed: {_result_text(mutated)}"
+                            )
+                        final = await session.call_tool("get_page_text", {"tabId": tab_id})
+                        if final.isError or CHROME_SMOKE_MUTATED_MARKER not in _result_text(final):
+                            raise RuntimeError(
+                                "Agent-in-Chrome interaction was not reflected in the page: "
+                                f"{_result_text(final)}"
+                            )
+                errlog.seek(0)
+                stderr = errlog.read()
+                if "Traceback" in stderr:
+                    raise RuntimeError(f"agent-in-chrome emitted a traceback: {stderr}")
+            # The sidecar owns a detached Chromium process group. Give its
+            # SIGTERM handler time to release the profile before removing it.
+            await asyncio.sleep(1.5)
+    finally:
+        page_server.close()
+        await page_server.wait_closed()
 
 
 async def _run(

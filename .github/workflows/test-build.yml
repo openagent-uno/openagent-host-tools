@@ -42,7 +42,7 @@ jobs:
       - name: Verify live sidecar catalogs match the version lock
         shell: bash
         run: python scripts/snapshot_sidecar_manifests.py dist/* --check
-      - name: Smoke frozen core and computer-control under Xvfb
+      - name: Smoke frozen core, computer-control, and Chrome under Xvfb
         if: runner.os == 'Linux'
         shell: bash
         run: >-
@@ -52,10 +52,10 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: python scripts/smoke_bundle.py dist/* --core-only --computer-control expect-granted
-      - name: Smoke frozen core MCP runtime
+      - name: Smoke frozen core, computer-control, and Chrome on Windows desktop
         if: runner.os == 'Windows'
         shell: bash
-        run: python scripts/smoke_bundle.py dist/* --core-only --computer-control skip
+        run: python scripts/smoke_bundle.py dist/* --computer-control expect-granted
       - uses: actions/upload-artifact@v4
         with:
           name: openagent-host-tools-${{ runner.os }}-${{ runner.arch }}

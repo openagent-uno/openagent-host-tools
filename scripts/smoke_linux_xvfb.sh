@@ -17,4 +17,4 @@ xdpyinfo >/dev/null
 xmodmap -e 'keycode 255 ='
 
 "$python_bin" "$script_dir/smoke_bundle.py" "$bundle" \
-  --core-only --computer-control expect-granted
+  --computer-control expect-granted

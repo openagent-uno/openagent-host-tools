@@ -3,10 +3,13 @@ from __future__ import annotations
 import http.server
 import json
 import shutil
+import stat
+import struct
 import subprocess
 import sys
 import threading
 from dataclasses import replace
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -123,7 +126,8 @@ def test_browser_reuse_requires_exact_profile_ownership_marker(tmp_path: Path):
         owned = tmp_path / "owned"
         unrelated = tmp_path / "unrelated"
         wrong_port = tmp_path / "wrong-port"
-        for profile in (owned, unrelated, wrong_port):
+        recorded = tmp_path / "recorded"
+        for profile in (owned, unrelated, wrong_port, recorded):
             profile.mkdir()
         port = server.server_port
         (owned / "DevToolsActivePort").write_text(f"{port}\n{endpoint_path}\n")
@@ -135,11 +139,13 @@ def test_browser_reuse_requires_exact_profile_ownership_marker(tmp_path: Path):
         script = r"""
 import { pathToFileURL } from "node:url";
 const browser = await import(pathToFileURL(process.argv[1]).href);
-const port = Number(process.argv[5]);
+const port = Number(process.argv[6]);
+const wsUrl = `ws://127.0.0.1:${port}${process.argv[7]}`;
 const result = {
   owned: await browser.getProfileWsEndpoint(process.argv[2], port),
   unrelated: await browser.getProfileWsEndpoint(process.argv[3], port),
   wrongPort: await browser.getProfileWsEndpoint(process.argv[4], port),
+  recorded: await browser.recordProfileWsEndpoint(process.argv[5], port, wsUrl),
 };
 process.stdout.write(JSON.stringify(result));
 """
@@ -153,7 +159,9 @@ process.stdout.write(JSON.stringify(result));
                 str(owned),
                 str(unrelated),
                 str(wrong_port),
+                str(recorded),
                 str(port),
+                endpoint_path,
             ],
             check=True,
             capture_output=True,
@@ -165,7 +173,9 @@ process.stdout.write(JSON.stringify(result));
             "owned": f"ws://127.0.0.1:{port}{endpoint_path}",
             "unrelated": None,
             "wrongPort": None,
+            "recorded": f"ws://127.0.0.1:{port}{endpoint_path}",
         }
+        assert (recorded / "DevToolsActivePort").read_text() == (f"{port}\n{endpoint_path}\n")
     finally:
         server.shutdown()
         server.server_close()
@@ -331,6 +341,130 @@ process.stdout.write(JSON.stringify({
     assert "signed extension id does not match" in result["wrongIdError"]
     assert "signature verification failed" in result["wrongAlgorithmError"]
     assert "invalid Chrome Web Store extension id" in result["invalidIdError"]
+
+
+def _extract_extension_zip(archive: Path, destination: Path) -> dict:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required to exercise extension ZIP extraction")
+    browser_js = Path(__file__).parents[1] / "sidecars" / "agent-in-chrome" / "host" / "browser.js"
+    script = r"""
+import fs from "node:fs";
+import { pathToFileURL } from "node:url";
+const browser = await import(pathToFileURL(process.argv[1]).href);
+try {
+  browser.extractExtensionZip(fs.readFileSync(process.argv[2]), process.argv[3]);
+  process.stdout.write(JSON.stringify({ ok: true }));
+} catch (error) {
+  process.stdout.write(JSON.stringify({ ok: false, error: String(error.message) }));
+}
+"""
+    completed = subprocess.run(
+        [
+            node,
+            "--input-type=module",
+            "--eval",
+            script,
+            str(browser_js),
+            str(archive),
+            str(destination),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    return json.loads(completed.stdout)
+
+
+def _write_extension_zip(path: Path, entries: dict[str, bytes]) -> None:
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, content in entries.items():
+            archive.writestr(name, content)
+
+
+def test_extension_zip_extraction_is_self_contained_and_rejects_zip_slip(
+    tmp_path: Path,
+):
+    browser_js = Path(__file__).parents[1] / "sidecars" / "agent-in-chrome" / "host" / "browser.js"
+    source = browser_js.read_text(encoding="utf-8")
+    assert "spawnSync" not in source
+    assert 'from "node:zlib"' in source
+
+    good = tmp_path / "good.zip"
+    _write_extension_zip(
+        good,
+        {
+            "manifest.json": b'{"manifest_version":3,"name":"Smoke","version":"1"}',
+            "nested/content.js": b"globalThis.openAgentExtension = true;",
+        },
+    )
+    destination = tmp_path / "installed"
+    assert _extract_extension_zip(good, destination) == {"ok": True}
+    assert (destination / "nested" / "content.js").read_bytes().endswith(b"true;")
+
+    unsafe_names = (
+        "../outside.txt",
+        "..\\outside.txt",
+        "/absolute.txt",
+        "C:/outside.txt",
+        "nested/../../outside.txt",
+    )
+    for index, unsafe_name in enumerate(unsafe_names):
+        attack = tmp_path / f"attack-{index}.zip"
+        _write_extension_zip(
+            attack,
+            {
+                "manifest.json": b"{}",
+                unsafe_name: b"must-not-escape",
+            },
+        )
+        result = _extract_extension_zip(attack, destination)
+        assert result["ok"] is False
+        assert "path" in result["error"]
+        assert (destination / "nested" / "content.js").is_file()
+        assert not (tmp_path / "outside.txt").exists()
+
+
+def test_extension_zip_rejects_symlinks_duplicates_and_expansion_bombs(
+    tmp_path: Path,
+):
+    destination = tmp_path / "installed"
+
+    symlink = tmp_path / "symlink.zip"
+    with zipfile.ZipFile(symlink, "w") as archive:
+        archive.writestr("manifest.json", b"{}")
+        link = zipfile.ZipInfo("escape-link")
+        link.create_system = 3
+        link.external_attr = (stat.S_IFLNK | 0o777) << 16
+        archive.writestr(link, b"../outside.txt")
+    result = _extract_extension_zip(symlink, destination)
+    assert result["ok"] is False
+    assert "symlink" in result["error"].lower()
+
+    duplicate = tmp_path / "duplicate.zip"
+    _write_extension_zip(
+        duplicate,
+        {
+            "manifest.json": b"{}",
+            "nested/file.txt": b"one",
+            "nested\\file.txt": b"two",
+        },
+    )
+    result = _extract_extension_zip(duplicate, destination)
+    assert result["ok"] is False
+    assert "duplicate" in result["error"].lower()
+
+    bomb = tmp_path / "bomb.zip"
+    _write_extension_zip(bomb, {"manifest.json": b"{}", "large.bin": b"small"})
+    encoded = bytearray(bomb.read_bytes())
+    central = encoded.find(b"PK\x01\x02", encoded.find(b"PK\x01\x02") + 1)
+    assert central >= 0
+    struct.pack_into("<I", encoded, central + 24, 128 * 1024 * 1024 + 1)
+    bomb.write_bytes(encoded)
+    result = _extract_extension_zip(bomb, destination)
+    assert result["ok"] is False
+    assert "size limit" in result["error"].lower()
 
 
 @pytest.mark.asyncio

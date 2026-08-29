@@ -40,7 +40,65 @@ def test_linux_xvfb_smoke_prepares_a_real_input_connection():
     assert "xdpyinfo" in text
     assert "xmodmap -e 'keycode 255 ='" in text
     assert "--computer-control expect-granted" in text
+    assert "--core-only" not in text
     assert "env=dict(os.environ)" in inspect.getsource(smoke_bundle._computer_control)
+
+
+def test_linux_and_windows_release_smokes_exercise_real_chrome_and_desktop():
+    chrome_source = inspect.getsource(smoke_bundle._chrome)
+    for required in (
+        "session.list_tools()",
+        '"tabs_context_mcp"',
+        '"navigate"',
+        '"javascript_tool"',
+        '"get_page_text"',
+        "CHROME_SMOKE_MUTATED_MARKER",
+    ):
+        assert required in chrome_source
+
+    workflows = {
+        "test-build.yml": (
+            "python scripts/smoke_bundle.py dist/* --computer-control expect-granted"
+        ),
+        "release.yml": (
+            "python scripts/smoke_bundle.py dist/${{ matrix.platform }} "
+            "--computer-control expect-granted"
+        ),
+    }
+    for name, windows_command in workflows.items():
+        workflow = (ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+        assert "computer-control, and Chrome under Xvfb" in workflow
+        assert "computer-control, and Chrome on Windows desktop" in workflow
+        assert windows_command in workflow
+        assert "--core-only --computer-control skip" not in workflow
+
+
+def test_frozen_core_smoke_consumes_shell_completion_notifications():
+    source = inspect.getsource(smoke_bundle._core)
+    assert "logging_callback=logging_callback" in source
+    assert '"run_in_background": True' in source
+    assert "SHELL_COMPLETION_CAPABILITY" in source
+    assert 'event.get("type") != "shell_completed"' in source
+
+
+def test_chrome_smoke_tab_context_requires_a_real_integer_tab_id():
+    valid = mcp_types.CallToolResult(
+        content=[
+            mcp_types.TextContent(
+                type="text",
+                text=(
+                    '{"availableTabs":[{"tabId":7,"title":"Smoke",'
+                    '"url":"about:blank"}]}\n\nTab Context:'
+                ),
+            )
+        ]
+    )
+    assert smoke_bundle._tab_id_from_context(valid) == 7
+    invalid = mcp_types.CallToolResult(
+        content=[mcp_types.TextContent(type="text", text='{"availableTabs":[{"tabId":"7"}]}')]
+    )
+    with pytest.raises(RuntimeError, match="non-integer tab id"):
+        smoke_bundle._tab_id_from_context(invalid)
 
 
 def test_macos_launchservices_stdio_uses_real_fifo_paths():
@@ -93,17 +151,13 @@ def test_computer_control_smoke_validates_cursor_png_and_tcc_errors(tmp_path: Pa
     accessibility = mcp_types.CallToolResult(
         isError=True,
         content=[
-            mcp_types.TextContent(
-                type="text", text="macOS Accessibility permission required."
-            )
+            mcp_types.TextContent(type="text", text="macOS Accessibility permission required.")
         ],
     )
     screen_recording = mcp_types.CallToolResult(
         isError=True,
         content=[
-            mcp_types.TextContent(
-                type="text", text="macOS Screen Recording permission required."
-            )
+            mcp_types.TextContent(type="text", text="macOS Screen Recording permission required.")
         ],
     )
     smoke_bundle._require_permission_error(accessibility, "Accessibility")
@@ -204,9 +258,7 @@ def test_release_archive_is_verified_before_and_after_safe_extraction(tmp_path: 
         archive, destination, expected_platform="darwin-arm64"
     )
     assert (bundle / "openagent-host-tools").read_bytes() == b"host"
-    assert (
-        bundle / "openagent-computer-control.app" / "Contents" / "Resources"
-    ).is_dir()
+    assert (bundle / "openagent-computer-control.app" / "Contents" / "Resources").is_dir()
 
 
 def test_release_archive_rejects_files_absent_from_manifest(tmp_path: Path):

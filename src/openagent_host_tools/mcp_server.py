@@ -23,12 +23,16 @@ from .builtins import EditorServer, FilesystemServer, ShellServer
 from .context import current_principal
 from .types import HostError, ToolClassification, tool_error_result
 
+SHELL_COMPLETION_LOGGER = "openagent.shell"
+SHELL_COMPLETION_CAPABILITY = "openagent/shell-completion"
+SHELL_COMPLETION_CAPABILITY_VERSION = "1"
 
-def _server(name: str):
+
+def _server(name: str, *, shell_event_sink=None):
     factories = {
         "filesystem": FilesystemServer,
         "editor": EditorServer,
-        "shell": ShellServer,
+        "shell": lambda cwd: ShellServer(cwd, event_sink=shell_event_sink),
     }
     try:
         return factories[name](Path.cwd())
@@ -52,7 +56,35 @@ def _tool_wire(tool) -> mcp_types.Tool:
 
 
 async def serve(name: str) -> None:
-    capability = _server(name)
+    notification_session = None
+
+    async def emit_shell_event(event: dict[str, Any]) -> None:
+        # MCP deliberately has no general-purpose custom-notification frame.
+        # A logging notification is the standard, typed server-to-client
+        # channel, while the experimental capability below makes the event
+        # contract discoverable instead of asking consumers to scrape logs.
+        session = notification_session
+        if session is None:
+            return
+        try:
+            await session.send_log_message(
+                "notice",
+                event,
+                logger=SHELL_COMPLETION_LOGGER,
+            )
+        except (
+            anyio.BrokenResourceError,
+            anyio.ClosedResourceError,
+            anyio.EndOfStream,
+        ):
+            # The process may be shutting down while a background command
+            # exits. The command has already been finalized at this point.
+            return
+
+    capability = _server(
+        name,
+        shell_event_sink=emit_shell_event if name == "shell" else None,
+    )
     app = Server(
         capability.manifest.name,
         version=capability.manifest.version,
@@ -65,6 +97,8 @@ async def serve(name: str) -> None:
 
     @app.call_tool(validate_input=True)
     async def call_tool(tool_name: str, arguments: dict[str, Any]):
+        nonlocal notification_session
+        notification_session = app.request_context.session
         token = current_principal.set("standalone-mcp-stdio")
         try:
             try:
@@ -78,8 +112,28 @@ async def serve(name: str) -> None:
         finally:
             current_principal.reset(token)
 
+    if name == "shell":
+
+        @app.set_logging_level()
+        async def set_logging_level(_level: mcp_types.LoggingLevel) -> None:
+            # Completion events are control-plane events rather than
+            # diagnostic verbosity, so a client logging threshold must not
+            # suppress them.
+            return None
+
+    experimental_capabilities = None
+    if name == "shell":
+        experimental_capabilities = {
+            SHELL_COMPLETION_CAPABILITY: {
+                "version": SHELL_COMPLETION_CAPABILITY_VERSION,
+                "transport": "notifications/message",
+                "logger": SHELL_COMPLETION_LOGGER,
+                "data": "shell_completed event",
+            }
+        }
     options = app.create_initialization_options(
-        NotificationOptions(tools_changed=False)
+        NotificationOptions(tools_changed=False),
+        experimental_capabilities=experimental_capabilities,
     )
     try:
         # Passing the process streams explicitly avoids the SDK allocating an

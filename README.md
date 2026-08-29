@@ -37,3 +37,13 @@ sources under `sidecars/` in this repository. Each native bundle contains a
 frozen hosts verify it before starting a sidecar. Tag `v0.1.0` publishes the
 universal Python wheel and native macOS, Linux and Windows x64/arm64 archives
 with detached checksums.
+
+The Python built-ins also have official MCP stdio entrypoints:
+`openagent-filesystem-mcp`, `openagent-editor-mcp`, and `openagent-shell-mcp`.
+The shell advertises the experimental capability
+`openagent/shell-completion` version `1`. Background completion is delivered as
+a standard `notifications/message` logging notification from logger
+`openagent.shell`; its `data` object is the same `shell_completed` event emitted
+by the embedded capability host. MCP consumers should register a logging
+callback and route that logger's data into the agent event/autoloop path rather
+than treating it as diagnostic text.

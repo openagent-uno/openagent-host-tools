@@ -131,15 +131,15 @@ jobs:
       - name: Smoke signed frozen MCP and browser runtime with runner TCC grants
         if: runner.os == 'macOS'
         run: python scripts/smoke_bundle.py dist/${{ matrix.platform }} --computer-control expect-granted
-      - name: Smoke frozen core and computer-control under Xvfb
+      - name: Smoke frozen core, computer-control, and Chrome under Xvfb
         if: runner.os == 'Linux'
         shell: bash
         run: >-
           xvfb-run -a -s '-screen 0 1280x1024x24'
           scripts/smoke_linux_xvfb.sh dist/${{ matrix.platform }}
-      - name: Smoke frozen core MCP runtime
+      - name: Smoke frozen core, computer-control, and Chrome on Windows desktop
         if: runner.os == 'Windows'
-        run: python scripts/smoke_bundle.py dist/${{ matrix.platform }} --core-only --computer-control skip
+        run: python scripts/smoke_bundle.py dist/${{ matrix.platform }} --computer-control expect-granted
       - name: Package and checksum
         run: python scripts/package_bundle.py dist/${{ matrix.platform }}
       - name: Verify final macOS archive after extraction
