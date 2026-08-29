@@ -11,6 +11,7 @@ import tarfile
 from pathlib import Path
 
 from project_metadata import PROJECT_VERSION
+from verify_bundle_archive import verify_archive
 
 
 SUPPORTED_PLATFORMS = (
@@ -64,36 +65,21 @@ def main() -> None:
             details.append(f"missing archives: {missing_archives}")
         if legacy_zip_assets:
             details.append(f"unsupported zip assets: {legacy_zip_assets}")
-        raise SystemExit("release artifact set must contain exactly six native bundles; " + "; ".join(details))
+        raise SystemExit(
+            "release artifact set must contain exactly six native bundles; "
+            + "; ".join(details)
+        )
     for archive_name, platform in expected_archives.items():
         archive = discovered_archives[archive_name]
-        with tarfile.open(archive, "r:gz") as bundle:
-            unsafe = [
-                candidate.name
-                for candidate in bundle.getmembers()
-                if not (candidate.isdir() or candidate.isfile())
-            ]
-            if unsafe:
-                raise SystemExit(
-                    f"unsupported archive member type in {archive.name}: {unsafe}"
-                )
-            member = next(
-                (
-                    candidate
-                    for candidate in bundle.getmembers()
-                    if candidate.name.endswith("/bundle-manifest.json")
-                ),
-                None,
+        try:
+            verified = verify_archive(
+                archive,
+                expected_platform=platform,
+                expected_version=args.version,
             )
-            if member is None:
-                raise SystemExit(f"bundle manifest missing from {archive.name}")
-            extracted = bundle.extractfile(member)
-            if extracted is None:
-                raise SystemExit(f"cannot read bundle manifest from {archive.name}")
-            manifest_bytes = extracted.read()
-            manifest = json.loads(manifest_bytes)
-            if manifest.get("platform") != platform or manifest.get("version") != args.version:
-                raise SystemExit(f"bundle identity mismatch in {archive.name}")
+        except (OSError, RuntimeError, tarfile.TarError) as exc:
+            raise SystemExit(f"invalid release archive {archive.name}: {exc}") from exc
+        manifest_bytes = verified.manifest_bytes
         assets[platform] = {
             "asset": archive.name,
             "archive_sha256": sha256(archive),
