@@ -207,20 +207,8 @@ async def _computer_control(
 
     if macos_launchservices:
         helper = bundle / "openagent-computer-control.app"
-        command = "/usr/bin/open"
-        command_args = [
-            "-n",
-            "-W",
-            "-g",
-            "--stdin",
-            "/dev/stdin",
-            "--stdout",
-            "/dev/stdout",
-            "--stderr",
-            "/dev/stderr",
-            "-a",
-            str(helper),
-        ]
+        command = str(Path(__file__).with_name("launch_macos_app_stdio.sh"))
+        command_args = [str(helper)]
     else:
         command = str(executable)
         command_args = []
@@ -236,64 +224,82 @@ async def _computer_control(
         env=dict(os.environ),
     )
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as errlog:
-        async with stdio_client(params, errlog=errlog) as (reader, writer):
-            async with ClientSession(reader, writer) as session:
-                initialized = await session.initialize()
-                if initialized.serverInfo.name != "computer-control":
-                    raise RuntimeError(
-                        "unexpected computer-control MCP identity: "
-                        f"{initialized.serverInfo.name}"
-                    )
-                catalog = await session.list_tools()
-                if [tool.name for tool in catalog.tools] != ["computer"]:
-                    raise RuntimeError(
-                        "unexpected computer-control tool catalog: "
-                        f"{[tool.name for tool in catalog.tools]}"
-                    )
-
-                if mode == "expect-denied":
-                    # Exercise both independent native permission gates.  The
-                    # screenshot probe comes first so an Accessibility denial
-                    # cannot accidentally skip the Screen Recording contract.
-                    screenshot = await session.call_tool(
-                        "computer", {"action": "get_screenshot"}
-                    )
-                    _require_permission_error(screenshot, "Screen Recording")
-                    cursor = await session.call_tool(
-                        "computer", {"action": "get_cursor_position"}
-                    )
-                    _require_permission_error(cursor, "Accessibility")
-                else:
-                    cursor = await session.call_tool(
-                        "computer", {"action": "get_cursor_position"}
-                    )
-                    _validate_cursor_result(cursor)
-                    movement = await session.call_tool(
-                        "computer",
-                        {
-                            "action": "mouse_move",
-                            "coordinate": list(CONTROLLED_CURSOR_TARGET),
-                        },
-                    )
-                    if movement.isError:
+        try:
+            async with stdio_client(params, errlog=errlog) as (reader, writer):
+                async with ClientSession(reader, writer) as session:
+                    initialized = await session.initialize()
+                    if initialized.serverInfo.name != "computer-control":
                         raise RuntimeError(
-                            "computer-control controlled mouse_move failed: "
-                            f"{_result_text(movement)}"
+                            "unexpected computer-control MCP identity: "
+                            f"{initialized.serverInfo.name}"
                         )
-                    await asyncio.sleep(0.1)
-                    moved_cursor = await session.call_tool(
-                        "computer", {"action": "get_cursor_position"}
-                    )
-                    _require_cursor_near(
-                        _validate_cursor_result(moved_cursor),
-                        CONTROLLED_CURSOR_TARGET,
-                    )
-                    screenshot = await session.call_tool(
-                        "computer", {"action": "get_screenshot"}
-                    )
-                    _validate_screenshot_result(screenshot)
-        errlog.seek(0)
-        stderr = errlog.read()
+                    catalog = await session.list_tools()
+                    if [tool.name for tool in catalog.tools] != ["computer"]:
+                        raise RuntimeError(
+                            "unexpected computer-control tool catalog: "
+                            f"{[tool.name for tool in catalog.tools]}"
+                        )
+
+                    if mode == "expect-denied":
+                        # Exercise both independent native permission gates.
+                        # A screenshot also reads the cursor for its crosshair,
+                        # so use the recording probe to reach Screen Recording
+                        # without first requiring Accessibility.
+                        with tempfile.TemporaryDirectory(
+                            prefix="openagent-denied-recording-"
+                        ) as denied_root:
+                            recording = await session.call_tool(
+                                "computer",
+                                {
+                                    "action": "start_screen_recording",
+                                    "fps": 1,
+                                    "max_duration_seconds": 1,
+                                    "path": str(Path(denied_root) / "denied.mp4"),
+                                },
+                            )
+                        _require_permission_error(recording, "Screen Recording")
+                        cursor = await session.call_tool(
+                            "computer", {"action": "get_cursor_position"}
+                        )
+                        _require_permission_error(cursor, "Accessibility")
+                    else:
+                        cursor = await session.call_tool(
+                            "computer", {"action": "get_cursor_position"}
+                        )
+                        _validate_cursor_result(cursor)
+                        movement = await session.call_tool(
+                            "computer",
+                            {
+                                "action": "mouse_move",
+                                "coordinate": list(CONTROLLED_CURSOR_TARGET),
+                            },
+                        )
+                        if movement.isError:
+                            raise RuntimeError(
+                                "computer-control controlled mouse_move failed: "
+                                f"{_result_text(movement)}"
+                            )
+                        await asyncio.sleep(0.1)
+                        moved_cursor = await session.call_tool(
+                            "computer", {"action": "get_cursor_position"}
+                        )
+                        _require_cursor_near(
+                            _validate_cursor_result(moved_cursor),
+                            CONTROLLED_CURSOR_TARGET,
+                        )
+                        screenshot = await session.call_tool(
+                            "computer", {"action": "get_screenshot"}
+                        )
+                        _validate_screenshot_result(screenshot)
+        except BaseException:
+            errlog.seek(0)
+            captured = errlog.read()
+            if captured:
+                print(captured, file=sys.stderr, end="")
+            raise
+        finally:
+            errlog.seek(0)
+            stderr = errlog.read()
     if "panicked at" in stderr or "stack backtrace" in stderr.lower():
         raise RuntimeError(f"computer-control emitted a panic: {stderr}")
 

@@ -43,6 +43,29 @@ def test_linux_xvfb_smoke_prepares_a_real_input_connection():
     assert "env=dict(os.environ)" in inspect.getsource(smoke_bundle._computer_control)
 
 
+def test_macos_launchservices_stdio_uses_real_fifo_paths():
+    relay = SCRIPTS / "launch_macos_app_stdio.sh"
+    text = relay.read_text(encoding="utf-8")
+    assert os.access(relay, os.X_OK)
+    assert 'mkfifo "$to_app" "$from_app"' in text
+    assert '--stdin "$to_app"' in text
+    assert '--stdout "$from_app"' in text
+    assert "/dev/stdin" not in text
+    assert "/dev/stdout" not in text
+    source = inspect.getsource(smoke_bundle._computer_control)
+    assert 'with_name("launch_macos_app_stdio.sh")' in source
+
+
+def test_macos_capture_preflights_screen_recording_and_fails_closed():
+    source = (ROOT / "sidecars" / "computer-control" / "src" / "capture.rs").read_text(
+        encoding="utf-8"
+    )
+    assert "CGPreflightScreenCaptureAccess" in source
+    assert "CGRequestScreenCaptureAccess" in source
+    assert source.count("require_screen_recording_permission()?") == 2
+    assert "Err(anyhow!(MAC_SCREEN_RECORDING_HINT))" in source
+
+
 def test_computer_control_smoke_validates_cursor_png_and_tcc_errors(tmp_path: Path):
     cursor = mcp_types.CallToolResult(
         content=[mcp_types.TextContent(type="text", text='{"x":12,"y":34}')]
@@ -115,8 +138,8 @@ def test_computer_control_smoke_validates_cursor_png_and_tcc_errors(tmp_path: Pa
     )
     assert launchservices.macos_launchservices is True
     source = inspect.getsource(smoke_bundle._computer_control)
-    assert source.index('"get_screenshot"') < source.index('"get_cursor_position"')
-    assert 'command = "/usr/bin/open"' in source
+    assert source.index('"start_screen_recording"') < source.index('"get_cursor_position"')
+    assert 'with_name("launch_macos_app_stdio.sh")' in source
     if sys.platform != "darwin":
         with pytest.raises(RuntimeError, match="requires macOS and expect-denied"):
             asyncio.run(

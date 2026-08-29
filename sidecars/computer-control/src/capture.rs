@@ -30,6 +30,9 @@ pub struct CaptureResult {
 /// region) — callers need the full logical extents to map cursor / click
 /// coordinates back to API space via [`crate::scaling::api_to_logical`].
 pub fn capture_primary_display_region(region: Option<LogicalRegion>) -> Result<CaptureResult> {
+    #[cfg(target_os = "macos")]
+    require_screen_recording_permission()?;
+
     let image = try_xcap(region)
         .or_else(|e| {
             tracing::warn!("xcap capture failed: {e}, trying fallback");
@@ -58,6 +61,9 @@ pub fn capture_primary_display_region(region: Option<LogicalRegion>) -> Result<C
 pub fn capture_primary_frame_rgba(
     region: Option<LogicalRegion>,
 ) -> Result<(RgbaImage, u32, u32)> {
+    #[cfg(target_os = "macos")]
+    require_screen_recording_permission()?;
+
     let primary = primary_or_first_monitor()?;
     let rgba: RgbaImage = match primary.capture_image() {
         Ok(img) => img,
@@ -250,6 +256,31 @@ fn is_permission_error(e: &anyhow::Error) -> bool {
         || s.contains("not authorized")
         || s.contains("cgrequestscreencaptureaccess")
         || s.contains("kcgerror")
+}
+
+// xcap/CGWindow can return a syntactically valid black frame when macOS has
+// denied Screen Recording. Treating that as success is both misleading and a
+// permission-boundary bug: callers must never infer that pixels were captured
+// when TCC withheld them. Use Apple's explicit preflight before every capture.
+// The request call registers the stable signed helper with System Settings and
+// presents the native prompt when appropriate; this process still fails closed
+// until the user grants access and restarts it.
+#[cfg(target_os = "macos")]
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGPreflightScreenCaptureAccess() -> bool;
+    fn CGRequestScreenCaptureAccess() -> bool;
+}
+
+#[cfg(target_os = "macos")]
+fn require_screen_recording_permission() -> Result<()> {
+    // SAFETY: both zero-argument CoreGraphics functions are process-wide TCC
+    // queries available on every supported macOS version (10.15+).
+    if unsafe { CGPreflightScreenCaptureAccess() } {
+        return Ok(());
+    }
+    let _ = unsafe { CGRequestScreenCaptureAccess() };
+    Err(anyhow!(MAC_SCREEN_RECORDING_HINT))
 }
 
 #[cfg(target_os = "macos")]
