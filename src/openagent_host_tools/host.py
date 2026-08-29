@@ -6,7 +6,7 @@ import asyncio
 import json
 import time
 import uuid
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -30,9 +30,24 @@ from .types import (
     HostError,
     ServerManifest,
     ToolClassification,
+    ToolManifest,
     ToolResult,
     tool_error_result,
 )
+
+
+@dataclass(slots=True)
+class _AdmittedCall:
+    provider: CapabilityServer
+    tool_manifest: ToolManifest
+    mutating: bool
+    safe_retry: bool
+    claimed: bool
+    effective_idempotency_key: str | None
+    lease_entered: bool
+    task: asyncio.Task[ToolResult]
+    done_event: asyncio.Event
+    cancellation_requires_drain: bool
 
 
 class CapabilityHost:
@@ -109,6 +124,11 @@ class CapabilityHost:
         self._retained_lease_principals: set[str] = set()
         self._principals: set[str] = set()
         self._resource_owners: dict[tuple[str, str], str] = {}
+        # Admission and consent revocation share this barrier. A disable writes
+        # durable consent first, then waits here until every pre-dispatch call
+        # either becomes tracked in _active or aborts without an effect.
+        self._admission_lock = asyncio.Lock()
+        self._consent_lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
 
     async def start(self) -> None:
@@ -122,20 +142,27 @@ class CapabilityHost:
     async def set_consent(
         self, enabled: bool, *, version: int = CONSENT_VERSION
     ) -> ConsentState:
-        state = self.consent_store.set_enabled(enabled, version=version)
-        async with self._lifecycle_lock:
+        async with self._consent_lock:
+            state = self.consent_store.set_enabled(enabled, version=version)
             if enabled:
-                await self._start_external_locked()
+                async with self._lifecycle_lock:
+                    await self._start_external_locked()
             else:
-                for call_id, task in list(self._active.items()):
-                    if call_id not in self._uncancellable_active:
-                        task.cancel()
-                if self._active:
-                    await asyncio.gather(*self._active.values(), return_exceptions=True)
-                for principal in list(self._principals):
-                    await self.release_principal(principal)
-                await self._stop_external_locked()
-        return state
+                # Consent is already durably false. Holding the admission
+                # barrier guarantees that no call can cross from ledger/lease
+                # setup into provider dispatch after the snapshot below.
+                async with self._admission_lock, self._lifecycle_lock:
+                    for call_id, task in list(self._active.items()):
+                        if call_id not in self._uncancellable_active:
+                            task.cancel()
+                    if self._active:
+                        await asyncio.gather(
+                            *self._active.values(), return_exceptions=True
+                        )
+                    for principal in list(self._principals):
+                        await self._release_principal_admitted(principal)
+                    await self._stop_external_locked()
+            return state
 
     def consent(self) -> ConsentState:
         return self.consent_store.load()
@@ -209,133 +236,28 @@ class CapabilityHost:
             )
         self._principals.add(principal)
 
-        # Re-read durable consent on every call so a revoke from Desktop or CLI
-        # takes effect in already-running peers without a restart.
-        if not self.consent().enabled:
-            await self._audit_denial(call_id, principal, server, tool, args, "consent_required")
-            raise HostError(
-                "consent_required",
-                "local tools are disabled on this device",
-                {"consent_path": str(self.paths.consent)},
-            )
-        if not self._started:
-            await self.start()
-        provider = self._servers.get(server)
-        manifest = provider.manifest if provider is not None else None
-        tool_manifest = manifest.tool(tool) if manifest is not None else None
-        if provider is None or tool_manifest is None or not self._health.get(
-            server, {}
-        ).get("available", True):
-            await self._audit_denial(call_id, principal, server, tool, args, "tool_not_found")
-            raise HostError(
-                "tool_not_found",
-                f"no local tool {server}.{tool}",
-                {"server": server, "tool": tool},
-            )
-
-        if server == "computer-control" and args.get("action") in {
-            "start_screen_recording",
-            "stop_screen_recording",
-        }:
-            owner = self._resource_owners.get((server, "screen-recording"))
-            if owner is not None and owner != principal:
-                await self._audit_denial(
-                    call_id,
-                    principal,
-                    server,
-                    tool,
-                    args,
-                    "resource_owner_mismatch",
-                )
-                raise HostError(
-                    "resource_owner_mismatch",
-                    "screen recording belongs to a different local client account",
-                )
-
-        mutating = tool_manifest.classification != ToolClassification.READ_ONLY
-        safe_retry = tool_manifest.classification in {
-            ToolClassification.READ_ONLY,
-            ToolClassification.IDEMPOTENT,
-        }
-        claimed = False
-        effective_idempotency_key = idempotency_key or call_id
-        if effective_idempotency_key:
-            try:
-                claim = await self.idempotency.claim(
-                    principal,
-                    effective_idempotency_key,
-                    server=server,
-                    tool=tool,
-                    args=args,
-                    retry_stale=safe_retry,
-                )
-            except HostError as exc:
-                await self.audit.append(
-                    call_id=call_id,
-                    principal=principal,
-                    server=server,
-                    tool=tool,
-                    classification=tool_manifest.classification.value,
-                    outcome="error",
-                    argument_keys=list(args),
-                    duration_ms=int((time.monotonic() - started) * 1000),
-                    error_code=exc.code,
-                    arguments_sha256=actual_arguments_hash,
-                )
-                raise
-            if claim.state == "replay" and claim.result is not None:
-                result = claim.result
-                result.meta = {
-                    **result.meta,
-                    "openagent/idempotent": True,
-                    "openagent/replayed": True,
-                }
-                _mark_client_local(result)
-                await self.audit.append(
-                    call_id=call_id,
-                    principal=principal,
-                    server=server,
-                    tool=tool,
-                    classification=tool_manifest.classification.value,
-                    outcome="replay",
-                    argument_keys=list(args),
-                    duration_ms=int((time.monotonic() - started) * 1000),
-                    replayed=True,
-                    arguments_sha256=actual_arguments_hash,
-                )
-                return result
-            claimed = True
-
-        lease_entered = False
-        if mutating:
-            try:
-                await self.lease.enter(principal, call_id, f"{server}.{tool}")
-                lease_entered = True
-                self._retained_lease_principals.discard(principal)
-            except Exception:
-                if claimed and effective_idempotency_key:
-                    await self.idempotency.abandon(principal, effective_idempotency_key)
-                raise
-
-        async def invoke_provider() -> ToolResult:
-            token = current_principal.set(principal)
-            try:
-                return await provider.call(tool, args)
-            finally:
-                current_principal.reset(token)
-
-        task = asyncio.create_task(invoke_provider(), name=f"local-tool-{call_id}")
-        self._active[call_id] = task
-        self._active_principals[call_id] = principal
-        done_event = asyncio.Event()
-        self._active_done[call_id] = done_event
-        if mutating:
-            self._active_mutating.add(call_id)
-        cancellation_requires_drain = mutating and isinstance(
-            provider, (FilesystemServer, EditorServer)
+        admitted = await self._admit_call(
+            server=server,
+            tool=tool,
+            args=args,
+            principal=principal,
+            call_id=call_id,
+            idempotency_key=idempotency_key,
+            started=started,
+            arguments_sha256=actual_arguments_hash,
         )
-        if cancellation_requires_drain:
-            self._uncancellable_active.add(call_id)
+        if isinstance(admitted, ToolResult):
+            return admitted
+        provider = admitted.provider
+        tool_manifest = admitted.tool_manifest
+        mutating = admitted.mutating
+        safe_retry = admitted.safe_retry
+        claimed = admitted.claimed
+        effective_idempotency_key = admitted.effective_idempotency_key
+        lease_entered = admitted.lease_entered
+        task = admitted.task
+        done_event = admitted.done_event
+        cancellation_requires_drain = admitted.cancellation_requires_drain
         renewer = (
             asyncio.create_task(
                 self._renew_call(
@@ -551,16 +473,233 @@ class CapabilityHost:
             self._active_done.pop(call_id, None)
             done_event.set()
 
+    async def _admit_call(
+        self,
+        *,
+        server: str,
+        tool: str,
+        args: dict[str, Any],
+        principal: str,
+        call_id: str,
+        idempotency_key: str | None,
+        started: float,
+        arguments_sha256: str,
+    ) -> _AdmittedCall | ToolResult:
+        """Cross the consent boundary and register dispatch atomically.
+
+        ``set_consent(False)`` writes the durable bit before taking the same
+        barrier. It therefore cannot return while a call is hidden between its
+        first consent check and ``_active`` registration, and a call already in
+        that interval observes the second check and abandons its ledger/lease
+        without invoking the provider.
+        """
+
+        async with self._admission_lock:
+            claimed = False
+            lease_entered = False
+            dispatched = False
+            effective_idempotency_key = idempotency_key or call_id
+            try:
+                # Re-read durable consent on every call so a revoke from
+                # Desktop or CLI takes effect without a broker restart.
+                if not self.consent().enabled:
+                    await self._audit_denial(
+                        call_id, principal, server, tool, args, "consent_required"
+                    )
+                    raise HostError(
+                        "consent_required",
+                        "local tools are disabled on this device",
+                        {"consent_path": str(self.paths.consent)},
+                    )
+                if not self._started:
+                    await self.start()
+                provider = self._servers.get(server)
+                manifest = provider.manifest if provider is not None else None
+                tool_manifest = manifest.tool(tool) if manifest is not None else None
+                if provider is None or tool_manifest is None or not self._health.get(
+                    server, {}
+                ).get("available", True):
+                    await self._audit_denial(
+                        call_id, principal, server, tool, args, "tool_not_found"
+                    )
+                    raise HostError(
+                        "tool_not_found",
+                        f"no local tool {server}.{tool}",
+                        {"server": server, "tool": tool},
+                    )
+
+                if server == "computer-control" and args.get("action") in {
+                    "start_screen_recording",
+                    "stop_screen_recording",
+                }:
+                    owner = self._resource_owners.get((server, "screen-recording"))
+                    if owner is not None and owner != principal:
+                        await self._audit_denial(
+                            call_id,
+                            principal,
+                            server,
+                            tool,
+                            args,
+                            "resource_owner_mismatch",
+                        )
+                        raise HostError(
+                            "resource_owner_mismatch",
+                            "screen recording belongs to a different local client account",
+                        )
+
+                mutating = (
+                    tool_manifest.classification != ToolClassification.READ_ONLY
+                )
+                safe_retry = tool_manifest.classification in {
+                    ToolClassification.READ_ONLY,
+                    ToolClassification.IDEMPOTENT,
+                }
+                if effective_idempotency_key:
+                    try:
+                        claim = await self.idempotency.claim(
+                            principal,
+                            effective_idempotency_key,
+                            server=server,
+                            tool=tool,
+                            args=args,
+                            retry_stale=safe_retry,
+                        )
+                    except HostError as exc:
+                        await self.audit.append(
+                            call_id=call_id,
+                            principal=principal,
+                            server=server,
+                            tool=tool,
+                            classification=tool_manifest.classification.value,
+                            outcome="error",
+                            argument_keys=list(args),
+                            duration_ms=int((time.monotonic() - started) * 1000),
+                            error_code=exc.code,
+                            arguments_sha256=arguments_sha256,
+                        )
+                        raise
+                    if claim.state == "replay" and claim.result is not None:
+                        if not self.consent().enabled:
+                            await self._audit_denial(
+                                call_id,
+                                principal,
+                                server,
+                                tool,
+                                args,
+                                "consent_required",
+                            )
+                            raise HostError(
+                                "consent_required",
+                                "local tools are disabled on this device",
+                                {"consent_path": str(self.paths.consent)},
+                            )
+                        result = claim.result
+                        result.meta = {
+                            **result.meta,
+                            "openagent/idempotent": True,
+                            "openagent/replayed": True,
+                        }
+                        _mark_client_local(result)
+                        await self.audit.append(
+                            call_id=call_id,
+                            principal=principal,
+                            server=server,
+                            tool=tool,
+                            classification=tool_manifest.classification.value,
+                            outcome="replay",
+                            argument_keys=list(args),
+                            duration_ms=int((time.monotonic() - started) * 1000),
+                            replayed=True,
+                            arguments_sha256=arguments_sha256,
+                        )
+                        return result
+                    claimed = True
+
+                if mutating:
+                    await self.lease.enter(principal, call_id, f"{server}.{tool}")
+                    lease_entered = True
+                    self._retained_lease_principals.discard(principal)
+
+                # A disable can write the durable state while this coroutine is
+                # waiting in SQLite. Reject before create_task: no provider code
+                # has run, so the claim and lease remain safely abandonable.
+                if not self.consent().enabled:
+                    await self._audit_denial(
+                        call_id, principal, server, tool, args, "consent_required"
+                    )
+                    raise HostError(
+                        "consent_required",
+                        "local tools were disabled before dispatch",
+                        {"consent_path": str(self.paths.consent)},
+                    )
+
+                async def invoke_provider() -> ToolResult:
+                    token = current_principal.set(principal)
+                    try:
+                        return await provider.call(tool, args)
+                    finally:
+                        current_principal.reset(token)
+
+                task = asyncio.create_task(
+                    invoke_provider(), name=f"local-tool-{call_id}"
+                )
+                done_event = asyncio.Event()
+                self._active[call_id] = task
+                self._active_principals[call_id] = principal
+                self._active_done[call_id] = done_event
+                if mutating:
+                    self._active_mutating.add(call_id)
+                cancellation_requires_drain = mutating and isinstance(
+                    provider, (FilesystemServer, EditorServer)
+                )
+                if cancellation_requires_drain:
+                    self._uncancellable_active.add(call_id)
+                dispatched = True
+                return _AdmittedCall(
+                    provider=provider,
+                    tool_manifest=tool_manifest,
+                    mutating=mutating,
+                    safe_retry=safe_retry,
+                    claimed=claimed,
+                    effective_idempotency_key=effective_idempotency_key,
+                    lease_entered=lease_entered,
+                    task=task,
+                    done_event=done_event,
+                    cancellation_requires_drain=cancellation_requires_drain,
+                )
+            finally:
+                if not dispatched:
+                    if lease_entered:
+                        await self.lease.leave(principal, call_id)
+                    if claimed and effective_idempotency_key:
+                        await self.idempotency.abandon(
+                            principal, effective_idempotency_key
+                        )
+
     async def cancel(self, call_id: str) -> bool:
-        task = self._active.get(call_id)
-        if task is None or task.done():
-            return False
-        if call_id not in self._uncancellable_active:
-            task.cancel()
-        return True
+        # If the call is still waiting in ledger/lease admission, wait until it
+        # is either rejected or visible in _active before taking the snapshot.
+        async with self._admission_lock:
+            task = self._active.get(call_id)
+            if task is None or task.done():
+                return False
+            if call_id not in self._uncancellable_active:
+                task.cancel()
+            return True
 
     async def release_principal(self, principal: str | dict[str, Any]) -> None:
         principal_id = _principal_id(principal)
+        async with self._admission_lock:
+            active = self._begin_principal_release(principal_id)
+        await self._finish_principal_release(principal_id, active)
+
+    async def _release_principal_admitted(self, principal_id: str) -> None:
+        active = self._begin_principal_release(principal_id)
+        await self._finish_principal_release(principal_id, active)
+
+    def _begin_principal_release(
+        self, principal_id: str
+    ) -> list[tuple[str, asyncio.Task[ToolResult] | None, asyncio.Event | None]]:
         # A channel disappearing is not permission to unlock the machine while
         # one of its effects is still running. Drain local thread-backed work;
         # cancel cooperative work and wait until host.call has made the lease
@@ -582,6 +721,15 @@ class CapabilityHost:
                 and call_id not in self._uncancellable_active
             ):
                 task.cancel()
+        return active
+
+    async def _finish_principal_release(
+        self,
+        principal_id: str,
+        active: list[
+            tuple[str, asyncio.Task[ToolResult] | None, asyncio.Event | None]
+        ],
+    ) -> None:
         waits = [done.wait() for _call_id, _task, done in active if done is not None]
         if waits:
             await asyncio.gather(*waits)
@@ -648,18 +796,19 @@ class CapabilityHost:
                 continue
 
     async def close(self) -> None:
-        for call_id, task in list(self._active.items()):
-            if call_id not in self._uncancellable_active:
-                task.cancel()
-        if self._active:
-            await asyncio.gather(*self._active.values(), return_exceptions=True)
-        async with self._lifecycle_lock:
-            await self._stop_external_locked()
-        for server in list(self._servers.values()):
-            if server.manifest.name not in self._external_names:
-                await server.close()
-        for principal in list(self._principals):
-            await self.lease.release_principal(principal)
+        async with self._admission_lock:
+            for call_id, task in list(self._active.items()):
+                if call_id not in self._uncancellable_active:
+                    task.cancel()
+            if self._active:
+                await asyncio.gather(*self._active.values(), return_exceptions=True)
+            async with self._lifecycle_lock:
+                await self._stop_external_locked()
+            for server in list(self._servers.values()):
+                if server.manifest.name not in self._external_names:
+                    await server.close()
+            for principal in list(self._principals):
+                await self.lease.release_principal(principal)
 
     async def _start_external_locked(self) -> None:
         if self._external_started:

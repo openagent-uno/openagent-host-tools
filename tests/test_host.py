@@ -200,6 +200,56 @@ async def test_revocation_rejects_calls_and_is_shared(paths: HostPaths, tmp_path
 
 
 @pytest.mark.asyncio
+async def test_disable_is_a_barrier_for_calls_waiting_before_dispatch(
+    paths: HostPaths, tmp_path: Path
+):
+    host = CapabilityHost(paths=paths, cwd=tmp_path)
+    await host.start()
+    await host.set_consent(True)
+    target = tmp_path / "must-not-exist-after-disable.txt"
+    entered_claim = asyncio.Event()
+    release_claim = asyncio.Event()
+    original_claim = host.idempotency.claim
+
+    async def blocked_claim(*args, **kwargs):
+        entered_claim.set()
+        await release_claim.wait()
+        return await original_claim(*args, **kwargs)
+
+    host.idempotency.claim = blocked_claim
+    call = asyncio.create_task(
+        host.call(
+            "filesystem",
+            "write_file",
+            {"path": str(target), "content": "forbidden"},
+            principal="test",
+            call_id="disable-admission-race",
+        )
+    )
+    try:
+        await asyncio.wait_for(entered_claim.wait(), timeout=1)
+        disabling = asyncio.create_task(host.set_consent(False))
+
+        # set_consent has already persisted the revoke, but it must not return
+        # until the hidden pre-dispatch call crosses the admission barrier.
+        await asyncio.sleep(0.02)
+        assert host.consent().enabled is False
+        assert disabling.done() is False
+        assert target.exists() is False
+
+        release_claim.set()
+        await asyncio.wait_for(disabling, timeout=2)
+        with pytest.raises(HostError) as rejected:
+            await call
+        assert rejected.value.code == "consent_required"
+        assert target.exists() is False
+        assert (await host.lease.status())["state"] == "free"
+    finally:
+        release_claim.set()
+        await host.close()
+
+
+@pytest.mark.asyncio
 async def test_mutating_lease_releases_immediately(paths: HostPaths):
     first = MutatingLease(paths.state_db, lease_seconds=15)
     second = MutatingLease(paths.state_db, lease_seconds=15)
