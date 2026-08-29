@@ -365,9 +365,6 @@ class LocalBrokerServer:
     def _acquire_singleton(self) -> None:
         lock_path = self.paths.internal / "broker.lock"
         self._lock_file = open(lock_path, "a+b")
-        self._lock_file.seek(0)
-        self._lock_file.write(b"0")
-        self._lock_file.flush()
         try:
             if os.name == "nt":
                 import msvcrt
@@ -382,11 +379,25 @@ class LocalBrokerServer:
             self._lock_file.close()
             self._lock_file = None
             raise BrokerAlreadyRunning("local capability broker is already running") from exc
+        # Publish the exact lock owner only after acquiring the singleton. A
+        # contender must never overwrite this marker before its lock attempt;
+        # Desktop/CLI diagnostics and test cleanup use it to identify the
+        # broker for this one isolated host-tools home on every OS.
+        self._lock_file.seek(0)
+        self._lock_file.truncate()
+        self._lock_file.write(str(os.getpid()).encode("ascii"))
+        self._lock_file.flush()
+        os.fsync(self._lock_file.fileno())
 
     def _release_singleton(self) -> None:
         if self._lock_file is None:
             return
         try:
+            self._lock_file.seek(0)
+            self._lock_file.truncate()
+            self._lock_file.write(b"0")
+            self._lock_file.flush()
+            os.fsync(self._lock_file.fileno())
             if os.name == "nt":
                 import msvcrt
 
@@ -756,65 +767,70 @@ class LocalCapabilityClient:
             self._indeterminate_on_disconnect.discard(request_id)
 
     async def _listen(self, transport: LocalBrokerClient) -> None:
-        while True:
-            frame = await transport.receive()
-            if frame is None:
-                break
-            if frame.get("type") == "event":
-                event = frame.get("event")
-                if isinstance(event, dict):
-                    if event.get("type") == "catalog_changed":
-                        servers = event.get("servers")
-                        if (
-                            isinstance(servers, list)
-                            and self._transport is transport
-                        ):
-                            self._install_catalog(
-                                [
-                                    dict(server)
-                                    for server in servers
-                                    if isinstance(server, dict)
-                                ],
-                                transport,
+        try:
+            while True:
+                frame = await transport.receive()
+                if frame is None:
+                    break
+                if frame.get("type") == "event":
+                    event = frame.get("event")
+                    if isinstance(event, dict):
+                        if event.get("type") == "catalog_changed":
+                            servers = event.get("servers")
+                            if (
+                                isinstance(servers, list)
+                                and self._transport is transport
+                            ):
+                                self._install_catalog(
+                                    [
+                                        dict(server)
+                                        for server in servers
+                                        if isinstance(server, dict)
+                                    ],
+                                    transport,
+                                )
+                            for sink in list(self._catalog_sinks):
+                                try:
+                                    result = sink(dict(event))
+                                    if asyncio.iscoroutine(result):
+                                        await result
+                                except Exception:
+                                    continue
+                            continue
+                        if event.get("type") == "shell_completed" and event.get("shell_id"):
+                            key = (
+                                str(event.get("principal") or ""),
+                                str(event["shell_id"]),
                             )
-                        for sink in list(self._catalog_sinks):
+                            self._terminal_events[key] = dict(event)
+                        for sink in list(self._event_sinks):
                             try:
                                 result = sink(dict(event))
                                 if asyncio.iscoroutine(result):
                                     await result
                             except Exception:
                                 continue
-                        continue
-                    if event.get("type") == "shell_completed" and event.get("shell_id"):
-                        key = (
-                            str(event.get("principal") or ""),
-                            str(event["shell_id"]),
+                    continue
+                request_id = str(frame.get("id") or "")
+                future = self._pending.get(request_id)
+                if future is None or future.done():
+                    continue
+                if frame.get("ok"):
+                    future.set_result(dict(frame.get("result") or {}))
+                else:
+                    error = frame.get("error") or {}
+                    future.set_exception(
+                        HostError(
+                            str(error.get("code") or "host_error"),
+                            str(error.get("message") or "local broker request failed"),
+                            dict(error.get("data") or {}),
                         )
-                        self._terminal_events[key] = dict(event)
-                    for sink in list(self._event_sinks):
-                        try:
-                            result = sink(dict(event))
-                            if asyncio.iscoroutine(result):
-                                await result
-                        except Exception:
-                            continue
-                continue
-            request_id = str(frame.get("id") or "")
-            future = self._pending.get(request_id)
-            if future is None or future.done():
-                continue
-            if frame.get("ok"):
-                future.set_result(dict(frame.get("result") or {}))
-            else:
-                error = frame.get("error") or {}
-                future.set_exception(
-                    HostError(
-                        str(error.get("code") or "host_error"),
-                        str(error.get("message") or "local broker request failed"),
-                        dict(error.get("data") or {}),
                     )
-                )
-        await self._connection_lost(transport)
+        finally:
+            # EOF, malformed/oversized frames and transport implementation
+            # errors all invalidate this connection. Always detach it and
+            # resolve pending calls through the explicit safety contract.
+            await self._connection_lost(transport)
 
     async def _connection_lost(self, transport: LocalBrokerClient) -> None:
         """Detach one dead transport exactly once and make restart observable."""
@@ -829,7 +845,12 @@ class LocalCapabilityClient:
             self._tool_classifications.clear()
             self._tool_classification_rules.clear()
             self._catalog_transport = None
-        await transport.close()
+        try:
+            await transport.close()
+        except Exception:
+            # Closing a broken pipe/socket is best effort; pending calls still
+            # need the explicit disconnected/indeterminate result below.
+            pass
         for sink in list(self._disconnect_sinks):
             try:
                 result = sink()

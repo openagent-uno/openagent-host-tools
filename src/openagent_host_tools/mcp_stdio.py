@@ -330,21 +330,44 @@ class MCPStdioServer:
         assert process.stdout is not None
         try:
             while True:
-                line = await process.stdout.readline()
+                try:
+                    line = await process.stdout.readline()
+                except ValueError as exc:
+                    # StreamReader raises ValueError when a newline-delimited
+                    # JSON-RPC frame crosses its finite limit. Leaving the
+                    # child alive here would strand a healthy-looking adapter
+                    # with no stdout reader, so fail closed and let the normal
+                    # process watcher apply the bounded restart policy.
+                    self._stderr_tail = (
+                        "MCP stdout frame exceeded "
+                        f"{_MAX_MCP_STDIO_LINE_BYTES} bytes: {exc}"
+                    )[-8192:]
+                    if process.returncode is None:
+                        try:
+                            process.terminate()
+                        except ProcessLookupError:
+                            pass
+                    break
                 if not line:
                     break
                 try:
                     value = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(value, dict):
+                    continue
                 request_id = value.get("id")
                 if request_id is None:
                     continue
-                future = self._pending.get(int(request_id))
+                try:
+                    normalized_request_id = int(request_id)
+                except (TypeError, ValueError):
+                    continue
+                future = self._pending.get(normalized_request_id)
                 if (
                     future is None
                     or future.done()
-                    or self._pending_process.get(int(request_id)) is not process
+                    or self._pending_process.get(normalized_request_id) is not process
                 ):
                     continue
                 if "error" in value:

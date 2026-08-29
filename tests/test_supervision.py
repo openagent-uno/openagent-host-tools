@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from openagent_host_tools import CapabilityBridge, CapabilityHost, HostError, HostPaths
+from openagent_host_tools import mcp_stdio as mcp_stdio_module
 from openagent_host_tools.config import PluginSpec
 from openagent_host_tools.context import current_principal
 from openagent_host_tools.mcp_stdio import MCPStdioServer, PerPrincipalMCPPool
@@ -124,6 +125,46 @@ async def test_stdio_preserves_results_larger_than_asyncio_default_line_limit(
             }
         ]
         assert adapter.manifest.available is True
+        assert adapter.process is not None
+        assert adapter.process.returncode is None
+    finally:
+        await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_stdio_oversized_frame_fails_closed_and_recovers_via_supervisor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    script = _write_mcp(tmp_path)
+    state = tmp_path / "oversized-frame-starts.txt"
+    monkeypatch.setattr(
+        mcp_stdio_module,
+        "_MAX_MCP_STDIO_LINE_BYTES",
+        128 * 1024,
+    )
+    adapter = MCPStdioServer(
+        PluginSpec(
+            "oversized-frame",
+            (sys.executable, str(script)),
+            env={
+                "TEST_STATE_PATH": str(state),
+                "TEST_SERVER_NAME": "oversized-frame",
+            },
+        ),
+        restart_limit=1,
+        restart_initial_delay=0.01,
+        restart_max_delay=0.01,
+    )
+    try:
+        await adapter.start()
+        with pytest.raises(HostError, match="stdout frame exceeded"):
+            await adapter.call("large_image", {})
+        await _wait_until(
+            lambda: state.read_text(encoding="utf-8") == "2"
+            and adapter.manifest.available is True
+        )
+        recovered = await adapter.call("inspect", {})
+        assert recovered.structured_content == {"generation": 2}
         assert adapter.process is not None
         assert adapter.process.returncode is None
     finally:

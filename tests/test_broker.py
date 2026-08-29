@@ -43,6 +43,23 @@ def test_wire_argument_classification_is_conservative_and_order_independent():
     assert _classification_for_arguments("mutating", forward, {}) == "mutating"
 
 
+def test_singleton_lock_records_owner_without_contender_overwrite(tmp_path: Path):
+    paths = HostPaths.discover(tmp_path / "owner-marker-user")
+    owner = LocalBrokerServer(paths)
+    contender = LocalBrokerServer(paths)
+    lock_path = paths.internal / "broker.lock"
+    try:
+        owner._acquire_singleton()
+        assert lock_path.read_text(encoding="ascii") == str(os.getpid())
+        with pytest.raises(BrokerAlreadyRunning):
+            contender._acquire_singleton()
+        assert lock_path.read_text(encoding="ascii") == str(os.getpid())
+    finally:
+        contender._release_singleton()
+        owner._release_singleton()
+    assert lock_path.read_text(encoding="ascii") == "0"
+
+
 @pytest.mark.skipif(os.name == "nt", reason="Unix socket variant")
 @pytest.mark.asyncio
 async def test_single_instance_broker_vertical_slice(tmp_path: Path):
@@ -636,6 +653,35 @@ async def test_idempotent_plugin_broker_disconnect_is_retryable_not_indeterminat
     listener.cancel()
     await asyncio.gather(listener, return_exceptions=True)
     client._transport = None
+
+
+@pytest.mark.asyncio
+async def test_broker_listener_fails_pending_calls_on_frame_decode_error(tmp_path: Path):
+    class InvalidFrameTransport:
+        def __init__(self):
+            self.sent = asyncio.Event()
+            self.closed = False
+
+        async def send(self, _value):
+            self.sent.set()
+
+        async def receive(self):
+            await self.sent.wait()
+            raise ValueError("Separator is not found, and chunk exceed the limit")
+
+        async def close(self):
+            self.closed = True
+
+    client = LocalCapabilityClient(HostPaths.discover(tmp_path / "invalid-frame"))
+    transport = InvalidFrameTransport()
+    client._transport = transport
+    client._listener = asyncio.create_task(client._listen(transport))
+    with pytest.raises(HostError) as disconnected:
+        await asyncio.wait_for(client._request("status"), timeout=1)
+    assert disconnected.value.code == "broker_disconnected"
+    assert client._transport is None
+    assert client._listener is None
+    assert transport.closed is True
 
 
 @pytest.mark.asyncio
