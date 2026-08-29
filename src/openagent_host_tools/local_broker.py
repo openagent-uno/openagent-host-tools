@@ -22,6 +22,12 @@ from .host import CapabilityHost
 from .paths import HostPaths
 from .types import HostError, ToolResult
 
+# Control messages are newline-delimited JSON. Screenshots and other MCP media
+# can be much larger than asyncio's 64 KiB StreamReader default; keep this in
+# step with the bounded MCP stdio line size so a supported result can cross the
+# sidecar and local-broker boundaries without being truncated.
+_MAX_LOCAL_BROKER_LINE_BYTES = 128 * 1024 * 1024
+
 
 class BrokerAlreadyRunning(RuntimeError):
     pass
@@ -99,7 +105,11 @@ class LocalBrokerServer:
         bound = self._unix_socket
         if bound is None:
             raise RuntimeError("local capability socket was not prepared")
-        server = await asyncio.start_unix_server(self._handle_unix, sock=bound)
+        server = await asyncio.start_unix_server(
+            self._handle_unix,
+            sock=bound,
+            limit=_MAX_LOCAL_BROKER_LINE_BYTES,
+        )
         # asyncio owns the bound socket after a successful server creation.
         self._unix_socket = None
         self._unix_server = server
@@ -412,7 +422,8 @@ class LocalBrokerClient:
             )
         else:
             self._reader, self._writer = await asyncio.open_unix_connection(
-                str(_unix_socket_path(self.paths))
+                str(_unix_socket_path(self.paths)),
+                limit=_MAX_LOCAL_BROKER_LINE_BYTES,
             )
 
     async def send(self, value: dict[str, Any]) -> None:

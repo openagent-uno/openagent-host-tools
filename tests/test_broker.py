@@ -118,6 +118,53 @@ async def test_single_instance_broker_vertical_slice(tmp_path: Path):
     assert not server.unix_socket_path.exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Unix StreamReader limit regression")
+@pytest.mark.asyncio
+async def test_broker_preserves_large_requests_and_results_in_both_directions(
+    tmp_path: Path,
+):
+    paths = HostPaths.discover(tmp_path / "large-wire-user")
+    server = LocalBrokerServer(paths)
+    server_task = asyncio.create_task(server.run())
+    for _ in range(100):
+        if server.unix_socket_path.exists():
+            break
+        await asyncio.sleep(0.01)
+    assert server.unix_socket_path.exists()
+
+    client = LocalCapabilityClient(paths)
+    payload = "large-broker-payload:" + "x" * (256 * 1024)
+    target = tmp_path / "large-broker.txt"
+    try:
+        await client.start()
+        await client.set_consent(True)
+        written = await client.call(
+            "filesystem",
+            "write_file",
+            {"path": str(target), "content": payload},
+            principal="large-wire-principal",
+            call_id="large-wire-write",
+        )
+        assert written.is_error is False
+        assert target.read_text(encoding="utf-8") == payload
+
+        read = await client.call(
+            "filesystem",
+            "read_text_file",
+            {"path": str(target)},
+            principal="large-wire-principal",
+            call_id="large-wire-read",
+        )
+        assert read.is_error is False
+        assert read.content == [{"type": "text", "text": payload}]
+    finally:
+        await client.close()
+        server_task.cancel()
+        await asyncio.gather(server_task, return_exceptions=True)
+
+    assert not server.unix_socket_path.exists()
+
+
 @pytest.mark.skipif(os.name == "nt", reason="Unix socket variant")
 @pytest.mark.asyncio
 async def test_sigterm_gracefully_removes_broker_socket(tmp_path: Path):
