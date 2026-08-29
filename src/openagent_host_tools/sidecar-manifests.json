@@ -1,0 +1,677 @@
+{
+  "agent-in-chrome": {
+    "id": "agent-in-chrome",
+    "instructions": "Control OpenAgent's dedicated Chromium profile on the current client. Call tabs_context_mcp before tab-specific tools. This is not the server's browser.",
+    "manifest_version": 1,
+    "name": "agent-in-chrome",
+    "os_requirements": [
+      "Chromium runtime and permission to create a persistent browser profile",
+      "Linux ARM64 and Windows ARM64 require an installed Chromium-family browser or OPENAGENT_CHROME_BINARY; no verified automatic snapshot is available"
+    ],
+    "platforms": [
+      "darwin-arm64",
+      "darwin-x64",
+      "linux-arm64",
+      "linux-x64",
+      "win32-arm64",
+      "win32-x64"
+    ],
+    "tools": [
+      {
+        "classification": "mutating",
+        "description": "List the browser tabs available to you. Call this once before any other browser tool so you know what tabs exist. Each new task should open its own tab with tabs_create_mcp unless told to reuse one.",
+        "input_schema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "additionalProperties": false,
+          "properties": {
+            "createIfEmpty": {
+              "description": "Open a fresh blank tab if none exist.",
+              "type": "boolean"
+            }
+          },
+          "type": "object"
+        },
+        "name": "tabs_context_mcp"
+      },
+      {
+        "classification": "mutating",
+        "description": "Open a new blank tab and return its tab ID.",
+        "input_schema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "properties": {},
+          "type": "object"
+        },
+        "name": "tabs_create_mcp"
+      },
+      {
+        "classification": "mutating",
+        "description": "Navigate a tab to a URL (protocol optional, defaults to https), or pass \"back\"/\"forward\" for history. Waits for the page to load.",
+        "input_schema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "additionalProperties": false,
+          "properties": {
+            "tabId": {
+              "description": "Tab ID from tabs_context_mcp. Call tabs_context_mcp first if you don't have one.",
+              "type": "number"
+            },
+            "url": {
+              "description": "URL, or \"back\"/\"forward\".",
+              "type": "string"
+            }
+          },
+          "required": [
+            "url",
+            "tabId"
+          ],
+          "type": "object"
+        },
+        "name": "navigate"
+      },
+      {
+        "classification": "mutating",
+        "description": "Mouse/keyboard/screenshot control of a tab. Prefer find + read_page (structured, cheap) to locate elements; only screenshot when you need to see pixels. Click at the center of the target. Coordinates are viewport pixels from a screenshot.",
+        "input_schema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "description": "The action to perform.",
+              "enum": [
+                "left_click",
+                "right_click",
+                "double_click",
+                "triple_click",
+                "type",
+                "screenshot",
+                "wait",
+                "scroll",
+                "key",
+                "left_click_drag",
+                "zoom",
+                "scroll_to",
+                "hover"
+              ],
+              "type": "string"
+            },
+            "coordinate": {
+              "description": "(x, y) target. For left_click_drag this is the end point.",
+              "items": {
+                "type": "number"
+              },
+              "maxItems": 2,
+              "minItems": 2,
+              "type": "array"
+            },
+            "duration": {
+              "description": "Seconds to wait (wait action).",
+              "maximum": 30,
+              "minimum": 0,
+              "type": "number"
+            },
+            "modifiers": {
+              "description": "Modifier keys, e.g. \"ctrl\", \"cmd+shift\".",
+              "type": "string"
+            },
+            "ref": {
+              "description": "Element ref from find/read_page (alternative to coordinate).",
+              "type": "string"
+            },
+            "region": {
+              "description": "(x0,y0,x1,y1) region for zoom.",
+              "items": {
+                "$ref": "#/properties/coordinate/items"
+              },
+              "maxItems": 4,
+              "minItems": 4,
+              "type": "array"
+            },
+            "repeat": {
+              "description": "Repeat count for key.",
+              "maximum": 100,
+              "minimum": 1,
+              "type": "number"
+            },
+            "scroll_amount": {
+              "description": "Scroll ticks (default 3).",
+              "maximum": 10,
+              "minimum": 1,
+              "type": "number"
+            },
+            "scroll_direction": {
+              "description": "Direction for scroll.",
+              "enum": [
+                "up",
+                "down",
+                "left",
+                "right"
+              ],
+              "type": "string"
+            },
+            "start_coordinate": {
+              "description": "(x, y) start for left_click_drag.",
+              "items": {
+                "$ref": "#/properties/coordinate/items"
+              },
+              "maxItems": 2,
+              "minItems": 2,
+              "type": "array"
+            },
+            "tabId": {
+              "description": "Tab ID from tabs_context_mcp. Call tabs_context_mcp first if you don't have one.",
+              "type": "number"
+            },
+            "text": {
+              "description": "Text to type, or space-separated keys for the key action (e.g. \"Enter\", \"cmd+a\").",
+              "type": "string"
+            }
+          },
+          "required": [
+            "action",
+            "tabId"
+          ],
+          "type": "object"
+        },
+        "name": "computer"
+      },
+      {
+        "classification": "read_only",
+        "description": "Find elements by natural-language description or visible text (e.g. \"search box\", \"log in button\", \"post title containing cats\"). Returns up to 20 matches with refs usable by computer/form_input. The cheapest way to locate something — prefer it over screenshots.",
+        "input_schema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "additionalProperties": false,
+          "properties": {
+            "query": {
+              "description": "What to find.",
+              "type": "string"
+            },
+            "tabId": {
+              "description": "Tab ID from tabs_context_mcp. Call tabs_context_mcp first if you don't have one.",
+              "type": "number"
+            }
+          },
+          "required": [
+            "query",
+            "tabId"
+          ],
+          "type": "object"
+        },
+        "name": "find"
+      },
+      {
+        "classification": "mutating",
+        "description": "Set the value of a form field by its ref (from find/read_page). Booleans toggle checkboxes; strings fill text inputs and select options.",
+        "input_schema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "additionalProperties": false,
+          "properties": {
+            "ref": {
+              "description": "Element ref.",
+              "type": "string"
+            },
+            "tabId": {
+              "description": "Tab ID from tabs_context_mcp. Call tabs_context_mcp first if you don't have one.",
+              "type": "number"
+            },
+            "value": {
+              "description": "Value to set.",
+              "type": [
+                "string",
+                "boolean",
+                "number"
+              ]
+            }
+          },
+          "required": [
+            "ref",
+            "value",
+            "tabId"
+          ],
+          "type": "object"
+        },
+        "name": "form_input"
+      },
+      {
+        "classification": "read_only",
+        "description": "Extract the main readable text of the page (article/body), stripped of markup. Ideal for reading posts, comments, and articles cheaply.",
+        "input_schema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "additionalProperties": false,
+          "properties": {
+            "tabId": {
+              "description": "Tab ID from tabs_context_mcp. Call tabs_context_mcp first if you don't have one.",
+              "type": "number"
+            }
+          },
+          "required": [
+            "tabId"
+          ],
+          "type": "object"
+        },
+        "name": "get_page_text"
+      },
+      {
+        "classification": "read_only",
+        "description": "Accessibility-tree view of the page with element refs. Use filter:\"interactive\" for just buttons/links/inputs. Output is capped; narrow with depth or ref_id if it truncates.",
+        "input_schema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "additionalProperties": false,
+          "properties": {
+            "depth": {
+              "description": "Max tree depth (default 15).",
+              "type": "number"
+            },
+            "filter": {
+              "description": "\"interactive\" or \"all\" (default).",
+              "enum": [
+                "interactive",
+                "all"
+              ],
+              "type": "string"
+            },
+            "max_chars": {
+              "$ref": "#/properties/depth",
+              "description": "Output cap (default 50000)."
+            },
+            "ref_id": {
+              "description": "Read only this element's subtree.",
+              "type": "string"
+            },
+            "tabId": {
+              "description": "Tab ID from tabs_context_mcp. Call tabs_context_mcp first if you don't have one.",
+              "type": "number"
+            }
+          },
+          "required": [
+            "tabId"
+          ],
+          "type": "object"
+        },
+        "name": "read_page"
+      },
+      {
+        "classification": "mutating",
+        "description": "Evaluate a JavaScript expression in the page and return its value. Write an expression (no `return`); promises are awaited.",
+        "input_schema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "const": "javascript_exec",
+              "description": "Must be 'javascript_exec'.",
+              "type": "string"
+            },
+            "tabId": {
+              "description": "Tab ID from tabs_context_mcp. Call tabs_context_mcp first if you don't have one.",
+              "type": "number"
+            },
+            "text": {
+              "description": "Expression to evaluate.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "action",
+            "text",
+            "tabId"
+          ],
+          "type": "object"
+        },
+        "name": "javascript_tool"
+      },
+      {
+        "classification": "mutating",
+        "description": "Read captured console output for a tab. Always pass a pattern to avoid noise.",
+        "input_schema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "additionalProperties": false,
+          "properties": {
+            "clear": {
+              "description": "Clear the buffer after reading.",
+              "type": "boolean"
+            },
+            "limit": {
+              "description": "Max messages (default 100).",
+              "type": "number"
+            },
+            "onlyErrors": {
+              "description": "Only errors/exceptions.",
+              "type": "boolean"
+            },
+            "pattern": {
+              "description": "Regex filter.",
+              "type": "string"
+            },
+            "tabId": {
+              "description": "Tab ID from tabs_context_mcp. Call tabs_context_mcp first if you don't have one.",
+              "type": "number"
+            }
+          },
+          "required": [
+            "tabId"
+          ],
+          "type": "object"
+        },
+        "name": "read_console_messages"
+      },
+      {
+        "classification": "mutating",
+        "description": "Read HTTP requests captured for a tab (recorded from the first time this tool is called on that tab).",
+        "input_schema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "additionalProperties": false,
+          "properties": {
+            "clear": {
+              "description": "Clear the buffer after reading.",
+              "type": "boolean"
+            },
+            "limit": {
+              "description": "Max requests (default 100).",
+              "type": "number"
+            },
+            "tabId": {
+              "description": "Tab ID from tabs_context_mcp. Call tabs_context_mcp first if you don't have one.",
+              "type": "number"
+            },
+            "urlPattern": {
+              "description": "Substring URL filter.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "tabId"
+          ],
+          "type": "object"
+        },
+        "name": "read_network_requests"
+      },
+      {
+        "classification": "mutating",
+        "description": "Resize the browser window / viewport.",
+        "input_schema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "additionalProperties": false,
+          "properties": {
+            "height": {
+              "description": "Height px.",
+              "type": "number"
+            },
+            "tabId": {
+              "description": "Tab ID from tabs_context_mcp. Call tabs_context_mcp first if you don't have one.",
+              "type": "number"
+            },
+            "width": {
+              "description": "Width px.",
+              "type": "number"
+            }
+          },
+          "required": [
+            "width",
+            "height",
+            "tabId"
+          ],
+          "type": "object"
+        },
+        "name": "resize_window"
+      },
+      {
+        "classification": "mutating",
+        "description": "Upload a previously captured screenshot to a file input identified by its ref.",
+        "input_schema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "additionalProperties": false,
+          "properties": {
+            "filename": {
+              "description": "Filename (default \"image.png\").",
+              "type": "string"
+            },
+            "imageId": {
+              "description": "Screenshot ID from computer's screenshot action.",
+              "type": "string"
+            },
+            "ref": {
+              "description": "Ref of the <input type=file> element.",
+              "type": "string"
+            },
+            "tabId": {
+              "description": "Tab ID from tabs_context_mcp. Call tabs_context_mcp first if you don't have one.",
+              "type": "number"
+            }
+          },
+          "required": [
+            "imageId",
+            "tabId"
+          ],
+          "type": "object"
+        },
+        "name": "upload_image"
+      },
+      {
+        "classification": "read_only",
+        "description": "List the browser extensions installed in the agent's browser (builtin + agent-installed).",
+        "input_schema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "properties": {},
+          "type": "object"
+        },
+        "name": "list_extensions"
+      },
+      {
+        "classification": "mutating",
+        "description": "Install a Chromium extension into the agent's browser from its Chrome Web Store ID (the 32-char id in the store URL), or a path to an unpacked extension. It persists across restarts and loads on every launch. Use for capabilities like a VPN/proxy extension — after installing, open it and sign in / pick options once. Restarts the browser to apply.",
+        "input_schema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "additionalProperties": false,
+          "properties": {
+            "source": {
+              "description": "Chrome Web Store extension ID (32 chars a–p) or a path to an unpacked extension directory.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "source"
+          ],
+          "type": "object"
+        },
+        "name": "install_extension"
+      },
+      {
+        "classification": "mutating",
+        "description": "Remove an agent-installed extension by its id (from list_extensions). Builtins can't be removed. Restarts the browser to apply.",
+        "input_schema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "description": "Extension id to remove.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        },
+        "name": "remove_extension"
+      }
+    ],
+    "version": "2.0.0"
+  },
+  "computer-control": {
+    "id": "computer-control",
+    "instructions": "Cross-platform mouse/keyboard/screenshot MCP for desktop GUI control.",
+    "manifest_version": 1,
+    "name": "computer-control",
+    "os_requirements": [
+      "macOS: Accessibility and Screen Recording permissions",
+      "Linux: an active graphical session with input/capture support",
+      "Windows: interactive desktop session"
+    ],
+    "platforms": [
+      "darwin-arm64",
+      "darwin-x64",
+      "linux-arm64",
+      "linux-x64",
+      "win32-arm64",
+      "win32-x64"
+    ],
+    "tools": [
+      {
+        "classification": "mutating",
+        "description": "Use a mouse and keyboard to interact with a computer, take screenshots, and record the screen.\n* This is an interface to a desktop GUI. You do not have access to a terminal or applications menu. You must click on desktop icons to start applications.\n* Always prefer using keyboard shortcuts rather than clicking, where possible.\n* If you see boxes with two letters in them, typing these letters will click that element. Use this instead of other shortcuts or clicking, where possible.\n* Some applications may take time to start or process actions, so you may need to wait and take successive screenshots to see the results of your actions. E.g. if you click on Firefox and a window doesn't open, try taking another screenshot.\n* Whenever you intend to move the cursor to click on an element like an icon, you should consult a screenshot to determine the coordinates of the element before moving the cursor.\n* If you tried clicking on a program or link but it failed to load, even after waiting, try adjusting your cursor position so that the tip of the cursor visually falls on the element that you want to click.\n* Make sure to click any buttons, links, icons, etc with the cursor tip in the center of the element. Don't click boxes on their edges unless asked.\n\nUsing the crosshair:\n* Screenshots show a red crosshair at the current cursor position.\n* After clicking, check where the crosshair appears vs your target. If it missed, adjust coordinates proportionally to the distance - start with large adjustments and refine. Avoid small incremental changes when the crosshair is far from the target (distances are often further than you expect).\n* Consider display dimensions when estimating positions. E.g. if it's 90% to the bottom of the screen, the coordinates should reflect this.\n\nRegion-of-interest (ROI):\n* `get_screenshot` and `start_screen_recording` accept an optional `region: [x, y, width, height]` in API image space. When set, the captured image/video is cropped to that rectangle before being downsampled, letting you focus the model on one pane or an animating element without capturing the whole screen.\n\nScreen recording:\n* `start_screen_recording` begins capturing the primary display to an `.mp4` file and returns immediately with the output path. Optional params: `fps` (1-60, default 30), `region` (ROI), `path` (defaults to a timestamped file in the OS temp dir), `max_duration_seconds` (auto-stop after N seconds).\n* `stop_screen_recording` stops the active recording and returns the final file path, frame count, and duration. Only one recording can be active at a time; starting a second before stopping the first returns an error.\n* Use recording to review animations, transitions, video playback, or any behavior that a single screenshot can't capture. Prefer a small `region` when possible — it keeps file size down and focuses the recording on the element under test.",
+        "input_schema": {
+          "$defs": {
+            "Action": {
+              "description": "All actions supported by the `computer` tool.\nNames are snake_case to match the MCP protocol surface (= TS enum values).",
+              "oneOf": [
+                {
+                  "const": "key",
+                  "description": "Press a key or key-combination on the keyboard.",
+                  "type": "string"
+                },
+                {
+                  "const": "type",
+                  "description": "Type a string of text on the keyboard.",
+                  "type": "string"
+                },
+                {
+                  "const": "mouse_move",
+                  "description": "Move the cursor to a specified (x, y) pixel coordinate on the screen.",
+                  "type": "string"
+                },
+                {
+                  "const": "left_click",
+                  "description": "Click the left mouse button.",
+                  "type": "string"
+                },
+                {
+                  "const": "left_click_drag",
+                  "description": "Click and drag the cursor to a specified (x, y) pixel coordinate.",
+                  "type": "string"
+                },
+                {
+                  "const": "right_click",
+                  "description": "Click the right mouse button.",
+                  "type": "string"
+                },
+                {
+                  "const": "middle_click",
+                  "description": "Click the middle mouse button.",
+                  "type": "string"
+                },
+                {
+                  "const": "double_click",
+                  "description": "Double-click the left mouse button.",
+                  "type": "string"
+                },
+                {
+                  "const": "scroll",
+                  "description": "Scroll the screen in a specified direction.",
+                  "type": "string"
+                },
+                {
+                  "const": "get_screenshot",
+                  "description": "Take a screenshot of the screen.",
+                  "type": "string"
+                },
+                {
+                  "const": "get_cursor_position",
+                  "description": "Get the current (x, y) pixel coordinate of the cursor on the screen.",
+                  "type": "string"
+                },
+                {
+                  "const": "start_screen_recording",
+                  "description": "Start recording the screen to an `.mp4` file. See `ComputerArgs`\nfor supported parameters (path, fps, region, max_duration_seconds).",
+                  "type": "string"
+                },
+                {
+                  "const": "stop_screen_recording",
+                  "description": "Stop the active screen recording and return the output file path.",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "description": "Input parameters for the `computer` tool.",
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/Action",
+              "description": "The action to perform. The available actions are:\n* key: Press a key or key-combination on the keyboard.\n* type: Type a string of text on the keyboard.\n* get_cursor_position: Get the current (x, y) pixel coordinate of the cursor on the screen.\n* mouse_move: Move the cursor to a specified (x, y) pixel coordinate on the screen.\n* left_click: Click the left mouse button. If coordinate is provided, moves to that position first.\n* left_click_drag: Click and drag the cursor to a specified (x, y) pixel coordinate on the screen.\n* right_click: Click the right mouse button. If coordinate is provided, moves to that position first.\n* middle_click: Click the middle mouse button. If coordinate is provided, moves to that position first.\n* double_click: Double-click the left mouse button. If coordinate is provided, moves to that position first.\n* scroll: Scroll the screen in a specified direction. Requires coordinate (moves there first) and text parameter with direction: \"up\", \"down\", \"left\", or \"right\". Optionally append \":N\" to scroll N pixels (default 300), e.g. \"down:500\".\n* get_screenshot: Take a screenshot of the screen."
+            },
+            "coordinate": {
+              "default": null,
+              "description": "`(x, y)`: The x (pixels from the left edge) and y (pixels from the top edge) coordinates in API image space; scaled to logical screen by the server.",
+              "items": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "maxItems": 2,
+              "minItems": 2,
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "fps": {
+              "default": null,
+              "description": "Frames per second for `start_screen_recording`. 1–60, default 30.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "max_duration_seconds": {
+              "default": null,
+              "description": "Optional auto-stop duration (in seconds) for `start_screen_recording`.\nWhen set, the recording stops on its own after this many seconds even\nif `stop_screen_recording` hasn't been called yet.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "path": {
+              "default": null,
+              "description": "Optional output path for `start_screen_recording`. If omitted, the\nserver writes to a timestamped `.mp4` in the OS temp directory and\nreturns the full path in the start response.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "region": {
+              "default": null,
+              "description": "Optional region-of-interest `[x, y, width, height]` in API image space.\nSupported by `get_screenshot` and `start_screen_recording` — the\ncaptured image / video is cropped to this rectangle before downsampling.\nUseful for focusing the model on a specific panel, a video player,\na toast, or isolating an animating element for frame-by-frame review.",
+              "items": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "maxItems": 4,
+              "minItems": 4,
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "text": {
+              "default": null,
+              "description": "Text to type or key command to execute.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "action"
+          ],
+          "title": "ComputerArgs",
+          "type": "object"
+        },
+        "name": "computer"
+      }
+    ],
+    "version": "0.1.0"
+  }
+}

@@ -1,0 +1,75 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "openagent-host-tools"
+dynamic = ["version"]
+description = "Local capability host shared by OpenAgent desktop and CLI clients"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "OpenAgent contributors" }]
+dependencies = [
+    "mcp>=1.27,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+openagent-host-tools = "openagent_host_tools.stdio:main"
+openagent-filesystem-mcp = "openagent_host_tools.mcp_server:filesystem_main"
+openagent-editor-mcp = "openagent_host_tools.mcp_server:editor_main"
+openagent-shell-mcp = "openagent_host_tools.mcp_server:shell_main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/openagent_host_tools"]
+
+[tool.hatch.version]
+path = "src/openagent_host_tools/_version.py"
+
+[tool.hatch.build.targets.wheel.force-include]
+"THIRD_PARTY_NOTICES.md" = "openagent_host_tools/THIRD_PARTY_NOTICES.md"
+"src/openagent_host_tools/builtins-lock.json" = "openagent_host_tools/builtins-lock.json"
+"src/openagent_host_tools/sidecar-manifests.json" = "openagent_host_tools/sidecar-manifests.json"
+"sidecars/agent-in-chrome/README.md" = "openagent_host_tools/sidecars/agent-in-chrome/README.md"
+"sidecars/agent-in-chrome/host/browser.js" = "openagent_host_tools/sidecars/agent-in-chrome/host/browser.js"
+"sidecars/agent-in-chrome/host/cdp.js" = "openagent_host_tools/sidecars/agent-in-chrome/host/cdp.js"
+"sidecars/agent-in-chrome/host/mcp-server.js" = "openagent_host_tools/sidecars/agent-in-chrome/host/mcp-server.js"
+"sidecars/agent-in-chrome/host/package-lock.json" = "openagent_host_tools/sidecars/agent-in-chrome/host/package-lock.json"
+"sidecars/agent-in-chrome/host/package.json" = "openagent_host_tools/sidecars/agent-in-chrome/host/package.json"
+"sidecars/agent-in-chrome/host/page-script.js" = "openagent_host_tools/sidecars/agent-in-chrome/host/page-script.js"
+"sidecars/agent-in-chrome/tab-group-extension/background.js" = "openagent_host_tools/sidecars/agent-in-chrome/tab-group-extension/background.js"
+"sidecars/agent-in-chrome/tab-group-extension/manifest.json" = "openagent_host_tools/sidecars/agent-in-chrome/tab-group-extension/manifest.json"
+"sidecars/computer-control/Cargo.lock" = "openagent_host_tools/sidecars/computer-control/Cargo.lock"
+"sidecars/computer-control/Cargo.toml" = "openagent_host_tools/sidecars/computer-control/Cargo.toml"
+"sidecars/computer-control/src" = "openagent_host_tools/sidecars/computer-control/src"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/openagent_host_tools",
+    "sidecars",
+    "scripts",
+    "openagent-host-tools.spec",
+    "README.md",
+    "THIRD_PARTY_NOTICES.md",
+    "LICENSE",
+]
+exclude = [
+    "**/node_modules/**",
+    "**/target/**",
+    "**/bin/**",
+    "dist/**",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
