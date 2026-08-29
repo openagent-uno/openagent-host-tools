@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import os
 import shlex
 import shutil
@@ -28,6 +28,14 @@ def _object(properties: dict[str, Any], required: list[str] | None = None) -> di
     }
 
 
+_COMPUTER_ACTION_CLASSIFICATIONS = {
+    "action": {
+        "get_cursor_position": ToolClassification.READ_ONLY,
+        "get_screenshot": ToolClassification.READ_ONLY,
+    }
+}
+
+
 COMPUTER_CONTROL_MANIFEST = ServerManifest(
     name="computer-control",
     version="1.0.0",
@@ -46,7 +54,7 @@ COMPUTER_CONTROL_MANIFEST = ServerManifest(
                         "enum": [
                             "key",
                             "type",
-                            "cursor_position",
+                            "get_cursor_position",
                             "mouse_move",
                             "left_click",
                             "left_click_drag",
@@ -71,6 +79,7 @@ COMPUTER_CONTROL_MANIFEST = ServerManifest(
                 ["action"],
             ),
             ToolClassification.MUTATING,
+            classification_by_argument=_COMPUTER_ACTION_CLASSIFICATIONS,
         ),
     ),
     available=False,
@@ -116,22 +125,122 @@ AGENT_IN_CHROME_MANIFEST = ServerManifest(
         "tabs_context_mcp before tab-specific tools. This is not the server's browser."
     ),
     tools=(
-        _chrome_tool("tabs_context_mcp", "List available browser tabs.", {"createIfEmpty": {"type": "boolean"}}),
+        _chrome_tool(
+            "tabs_context_mcp",
+            "List available browser tabs.",
+            {"createIfEmpty": {"type": "boolean"}},
+        ),
         _chrome_tool("tabs_create_mcp", "Open a blank tab.", {}, mutating=True),
-        _chrome_tool("navigate", "Navigate a tab to a URL or through history.", {"url": {"type": "string"}, "tabId": _TAB_ID}, ["url", "tabId"], mutating=True),
-        _chrome_tool("computer", "Mouse, keyboard and screenshot control for a browser tab.", {"action": {"type": "string"}, "tabId": _TAB_ID, "coordinate": {"type": "array"}, "text": {"type": "string"}, "ref": {"type": "string"}}, ["action", "tabId"], mutating=True),
-        _chrome_tool("find", "Find page elements and return stable refs.", {"query": {"type": "string"}, "tabId": _TAB_ID}, ["query", "tabId"]),
-        _chrome_tool("form_input", "Set a form field by ref.", {"ref": {"type": "string"}, "value": {}, "tabId": _TAB_ID}, ["ref", "value", "tabId"], mutating=True),
+        _chrome_tool(
+            "navigate",
+            "Navigate a tab to a URL or through history.",
+            {"url": {"type": "string"}, "tabId": _TAB_ID},
+            ["url", "tabId"],
+            mutating=True,
+        ),
+        _chrome_tool(
+            "computer",
+            "Mouse, keyboard and screenshot control for a browser tab.",
+            {
+                "action": {"type": "string"},
+                "tabId": _TAB_ID,
+                "coordinate": {"type": "array"},
+                "text": {"type": "string"},
+                "ref": {"type": "string"},
+            },
+            ["action", "tabId"],
+            mutating=True,
+        ),
+        _chrome_tool(
+            "find",
+            "Find page elements and return stable refs.",
+            {"query": {"type": "string"}, "tabId": _TAB_ID},
+            ["query", "tabId"],
+        ),
+        _chrome_tool(
+            "form_input",
+            "Set a form field by ref.",
+            {"ref": {"type": "string"}, "value": {}, "tabId": _TAB_ID},
+            ["ref", "value", "tabId"],
+            mutating=True,
+        ),
         _chrome_tool("get_page_text", "Extract readable page text.", {"tabId": _TAB_ID}, ["tabId"]),
-        _chrome_tool("read_page", "Read the accessibility tree with element refs.", {"tabId": _TAB_ID, "filter": {"type": "string"}, "depth": {"type": "number"}, "ref_id": {"type": "string"}, "max_chars": {"type": "number"}}, ["tabId"]),
-        _chrome_tool("javascript_tool", "Evaluate JavaScript in a tab.", {"action": {"const": "javascript_exec"}, "text": {"type": "string"}, "tabId": _TAB_ID}, ["action", "text", "tabId"], mutating=True),
-        _chrome_tool("read_console_messages", "Read captured console messages.", {"tabId": _TAB_ID, "pattern": {"type": "string"}, "limit": {"type": "number"}, "onlyErrors": {"type": "boolean"}, "clear": {"type": "boolean"}}, ["tabId"]),
-        _chrome_tool("read_network_requests", "Read captured network requests.", {"tabId": _TAB_ID, "urlPattern": {"type": "string"}, "limit": {"type": "number"}, "clear": {"type": "boolean"}}, ["tabId"]),
-        _chrome_tool("resize_window", "Resize the browser viewport.", {"width": {"type": "number"}, "height": {"type": "number"}, "tabId": _TAB_ID}, ["width", "height", "tabId"], mutating=True),
-        _chrome_tool("upload_image", "Upload a captured screenshot to a file input.", {"imageId": {"type": "string"}, "tabId": _TAB_ID, "ref": {"type": "string"}, "filename": {"type": "string"}}, ["imageId", "tabId"], mutating=True),
+        _chrome_tool(
+            "read_page",
+            "Read the accessibility tree with element refs.",
+            {
+                "tabId": _TAB_ID,
+                "filter": {"type": "string"},
+                "depth": {"type": "number"},
+                "ref_id": {"type": "string"},
+                "max_chars": {"type": "number"},
+            },
+            ["tabId"],
+        ),
+        _chrome_tool(
+            "javascript_tool",
+            "Evaluate JavaScript in a tab.",
+            {"action": {"const": "javascript_exec"}, "text": {"type": "string"}, "tabId": _TAB_ID},
+            ["action", "text", "tabId"],
+            mutating=True,
+        ),
+        _chrome_tool(
+            "read_console_messages",
+            "Read captured console messages.",
+            {
+                "tabId": _TAB_ID,
+                "pattern": {"type": "string"},
+                "limit": {"type": "number"},
+                "onlyErrors": {"type": "boolean"},
+                "clear": {"type": "boolean"},
+            },
+            ["tabId"],
+        ),
+        _chrome_tool(
+            "read_network_requests",
+            "Read captured network requests.",
+            {
+                "tabId": _TAB_ID,
+                "urlPattern": {"type": "string"},
+                "limit": {"type": "number"},
+                "clear": {"type": "boolean"},
+            },
+            ["tabId"],
+        ),
+        _chrome_tool(
+            "resize_window",
+            "Resize the browser viewport.",
+            {"width": {"type": "number"}, "height": {"type": "number"}, "tabId": _TAB_ID},
+            ["width", "height", "tabId"],
+            mutating=True,
+        ),
+        _chrome_tool(
+            "upload_image",
+            "Upload a captured screenshot to a file input.",
+            {
+                "imageId": {"type": "string"},
+                "tabId": _TAB_ID,
+                "ref": {"type": "string"},
+                "filename": {"type": "string"},
+            },
+            ["imageId", "tabId"],
+            mutating=True,
+        ),
         _chrome_tool("list_extensions", "List installed browser extensions.", {}),
-        _chrome_tool("install_extension", "Install a persistent Chromium extension.", {"source": {"type": "string"}}, ["source"], mutating=True),
-        _chrome_tool("remove_extension", "Remove an agent-installed extension.", {"id": {"type": "string"}}, ["id"], mutating=True),
+        _chrome_tool(
+            "install_extension",
+            "Install a persistent Chromium extension.",
+            {"source": {"type": "string"}},
+            ["source"],
+            mutating=True,
+        ),
+        _chrome_tool(
+            "remove_extension",
+            "Remove an agent-installed extension.",
+            {"id": {"type": "string"}},
+            ["id"],
+            mutating=True,
+        ),
     ),
     available=False,
     unavailable_reason="agent-in-chrome sidecar was not found",
@@ -165,17 +274,24 @@ def _authoritative_catalog(base: ServerManifest) -> ServerManifest:
         return base
     try:
         raw = json.loads(snapshot.read_text(encoding="utf-8"))[base.name]
-        tools = tuple(
-            ToolManifest(
-                name=str(tool["name"]),
-                description=str(tool.get("description") or ""),
-                input_schema=dict(tool.get("input_schema") or {"type": "object"}),
-                classification=ToolClassification(
-                    tool.get("classification", ToolClassification.MUTATING.value)
-                ),
+        tools = []
+        for tool in raw.get("tools", ()):
+            name = str(tool["name"])
+            fallback = base.tool(name)
+            tools.append(
+                ToolManifest(
+                    name=name,
+                    description=str(tool.get("description") or ""),
+                    input_schema=dict(tool.get("input_schema") or {"type": "object"}),
+                    classification=ToolClassification(
+                        tool.get("classification", ToolClassification.MUTATING.value)
+                    ),
+                    classification_by_argument=(
+                        fallback.classification_by_argument if fallback is not None else {}
+                    ),
+                )
             )
-            for tool in raw.get("tools", ())
-        )
+        tools = tuple(tools)
         if not tools:
             return base
         return replace(
@@ -292,15 +408,12 @@ def _discover(
     sidecar_dir = os.environ.get("OPENAGENT_HOST_TOOLS_SIDECAR_DIR")
     suffix = ".exe" if os.name == "nt" else ""
     candidates: list[tuple[Path, Path]] = []
+
     def add_root(root: Path) -> None:
         if sys.platform == "darwin":
             candidates.append(
                 (
-                    root
-                    / f"{executable}.app"
-                    / "Contents"
-                    / "MacOS"
-                    / executable,
+                    root / f"{executable}.app" / "Contents" / "MacOS" / executable,
                     root,
                 )
             )
@@ -330,8 +443,10 @@ def _parse_command(raw: str) -> tuple[str, ...]:
     value = raw.strip()
     if value.startswith("["):
         parsed = json.loads(value)
-        if not isinstance(parsed, list) or not parsed or not all(
-            isinstance(part, str) and part for part in parsed
+        if (
+            not isinstance(parsed, list)
+            or not parsed
+            or not all(isinstance(part, str) and part for part in parsed)
         ):
             raise ValueError("JSON command must be a non-empty string array")
         return tuple(parsed)
@@ -358,11 +473,7 @@ def _bundle_integrity_error(root: Path) -> str | None:
         files = value.get("files")
         if not isinstance(files, dict) or not files:
             raise ValueError("bundle file checksum map is empty")
-        links = [
-            path.relative_to(root).as_posix()
-            for path in root.rglob("*")
-            if path.is_symlink()
-        ]
+        links = [path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_symlink()]
         if links:
             raise ValueError(f"bundle contains unsupported links: {links}")
         actual_files = {

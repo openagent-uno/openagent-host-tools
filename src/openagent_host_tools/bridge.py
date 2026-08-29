@@ -43,6 +43,7 @@ class CapabilityBridge:
         generation: int | None = None,
         device_label: str | None = None,
         trusted_account_id: str | None = None,
+        trusted_network_id: str | None = None,
         trusted_device_id: str | None = None,
         on_transport_lost: Callable[[], Awaitable[None] | None] | None = None,
     ):
@@ -54,6 +55,7 @@ class CapabilityBridge:
         self.generation = generation or max(1, time.time_ns())
         self.device_label = device_label or platform.node() or platform.system()
         self.trusted_account_id = str(trusted_account_id) if trusted_account_id else None
+        self.trusted_network_id = str(trusted_network_id) if trusted_network_id else None
         self.trusted_device_id = str(trusted_device_id) if trusted_device_id else None
         self.on_transport_lost = on_transport_lost
         self.principal: dict[str, Any] = {
@@ -61,11 +63,12 @@ class CapabilityBridge:
             "client_instance_id": self.client_instance_id,
             "device_label": self.device_label,
             "account_id": self.trusted_account_id,
+            "network_id": self.trusted_network_id,
             "device_id": self.trusted_device_id,
             "generation": self.generation,
         }
         self._calls: dict[str, asyncio.Task[None]] = {}
-        self._principals: dict[str, dict[str, Any]] = {}
+        self._principals: dict[tuple[str | None, str], dict[str, Any]] = {}
         self._events_subscribed = False
         self._disconnect_subscribed = False
         self._transport_lost = False
@@ -81,6 +84,8 @@ class CapabilityBridge:
             "device_label": self.device_label,
             "servers": await self.host.catalog(),
         }
+        if self.trusted_network_id is not None:
+            frame["network_id"] = self.trusted_network_id
         await self._send(frame)
         return frame
 
@@ -112,9 +117,7 @@ class CapabilityBridge:
         # cannot strand a completed background shell.
         for frame in list(self._pending_events.values()):
             await self._send(dict(frame))
-        await self._send(
-            {"type": "capability_heartbeat", "generation": self.generation}
-        )
+        await self._send({"type": "capability_heartbeat", "generation": self.generation})
 
     async def handle(self, frame: dict[str, Any]) -> bool:
         frame_type = frame.get("type")
@@ -135,9 +138,7 @@ class CapabilityBridge:
                     call_id, HostError("duplicate_call", "call_id is already running")
                 )
                 return True
-            task = asyncio.create_task(
-                self._run_call(frame), name=f"gateway-local-tool-{call_id}"
-            )
+            task = asyncio.create_task(self._run_call(frame), name=f"gateway-local-tool-{call_id}")
             self._calls[call_id] = task
             task.add_done_callback(lambda _task, cid=call_id: self._calls.pop(cid, None))
             return True
@@ -206,6 +207,8 @@ class CapabilityBridge:
                 return
             if parsed.get("account_id") != self.trusted_account_id:
                 return
+            if parsed.get("network_id") != self.trusted_network_id:
+                return
             if self.trusted_device_id and parsed.get("device_id") != self.trusted_device_id:
                 return
             if int(parsed.get("generation") or -1) != self.generation:
@@ -234,19 +237,31 @@ class CapabilityBridge:
     async def _run_call(self, frame: dict[str, Any]) -> None:
         call_id = str(frame["call_id"])
         try:
+            server = str(frame.get("server") or "")
             received_account_id = frame.get("account_id")
             if self.trusted_account_id is None:
                 raise HostError(
                     "account_context_unavailable",
                     "this capability socket has no certified account binding",
                 )
-            if (
-                received_account_id is None
-                or str(received_account_id) != self.trusted_account_id
-            ):
+            if received_account_id is None or str(received_account_id) != self.trusted_account_id:
                 raise HostError(
                     "account_mismatch",
                     "capability call account does not match this certified connection",
+                )
+            received_network_id = frame.get("network_id")
+            if received_network_id is not None and (
+                self.trusted_network_id is None
+                or str(received_network_id) != self.trusted_network_id
+            ):
+                raise HostError(
+                    "network_mismatch",
+                    "capability call network does not match this certified connection",
+                )
+            if server == "agent-in-chrome" and self.trusted_network_id is None:
+                raise HostError(
+                    "network_context_unavailable",
+                    "agent-in-chrome requires a certified network binding",
                 )
             args = dict(frame.get("args") or {})
             expected_hash = frame.get("arguments_sha256")
@@ -258,9 +273,9 @@ class CapabilityBridge:
                     {"expected": str(expected_hash), "actual": actual_hash},
                 )
             principal = self.principal
-            self._principals[self.trusted_account_id] = principal
+            self._principals[(self.trusted_network_id, self.trusted_account_id)] = principal
             result = await self.host.call(
-                str(frame.get("server") or ""),
+                server,
                 str(frame.get("tool") or ""),
                 args,
                 principal=principal,
@@ -288,9 +303,7 @@ class CapabilityBridge:
             await self._send_error(call_id, HostError("host_error", str(exc)))
         else:
             try:
-                result_wire, artifacts = _prepare_result_artifacts(
-                    result.to_wire(), call_id
-                )
+                result_wire, artifacts = _prepare_result_artifacts(result.to_wire(), call_id)
                 for artifact in artifacts:
                     await self._send_artifact(call_id, artifact)
             except HostError as exc:
@@ -365,11 +378,7 @@ def _prepare_result_artifacts(
             return raw
         block_type = str(raw.get("type") or "")
         encoded: str | None = None
-        mime_type = str(
-            raw.get("mimeType")
-            or raw.get("mime_type")
-            or "application/octet-stream"
-        )
+        mime_type = str(raw.get("mimeType") or raw.get("mime_type") or "application/octet-stream")
         if block_type in {"image", "audio", "video", "file", "blob"} and isinstance(
             raw.get("data"), str
         ):
@@ -381,11 +390,7 @@ def _prepare_result_artifacts(
         ):
             resource = raw["resource"]
             encoded = resource["blob"]
-            mime_type = str(
-                resource.get("mimeType")
-                or resource.get("mime_type")
-                or mime_type
-            )
+            mime_type = str(resource.get("mimeType") or resource.get("mime_type") or mime_type)
         elif (
             block_type == "text"
             and isinstance(raw.get("text"), str)

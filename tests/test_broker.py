@@ -382,9 +382,7 @@ async def test_stdio_shim_exits_immediately_when_broker_dies_with_stdin_open(
             stderr=asyncio.subprocess.PIPE,
         )
         assert shim.stdin is not None and shim.stdout is not None
-        shim.stdin.write(
-            (json.dumps({"id": "init", "type": "initialize"}) + "\n").encode()
-        )
+        shim.stdin.write((json.dumps({"id": "init", "type": "initialize"}) + "\n").encode())
         await shim.stdin.drain()
         response = json.loads(await asyncio.wait_for(shim.stdout.readline(), timeout=2))
         assert response["ok"] is True
@@ -577,6 +575,55 @@ async def test_idempotent_plugin_broker_disconnect_is_retryable_not_indeterminat
     listener.cancel()
     await asyncio.gather(listener, return_exceptions=True)
     client._transport = None
+
+
+@pytest.mark.asyncio
+async def test_broker_disconnect_uses_action_level_classification(tmp_path: Path):
+    class EofTransport:
+        def __init__(self):
+            self.sent = asyncio.Event()
+
+        async def send(self, value):
+            del value
+            self.sent.set()
+
+        async def receive(self):
+            await self.sent.wait()
+            return None
+
+        async def close(self):
+            return None
+
+    async def disconnect_code(action: str) -> str:
+        client = LocalCapabilityClient(HostPaths.discover(tmp_path / action))
+        transport = EofTransport()
+        client._transport = transport
+        key = ("computer-control", "computer")
+        client._tool_classifications[key] = "mutating"
+        client._tool_classification_rules[key] = {
+            "action": {
+                "get_cursor_position": "read_only",
+                "get_screenshot": "read_only",
+            }
+        }
+        client._listener = asyncio.create_task(client._listen(transport))
+        try:
+            with pytest.raises(HostError) as disconnected:
+                await client.call(
+                    "computer-control",
+                    "computer",
+                    {"action": action},
+                    principal="account-a",
+                    call_id=f"computer-{action}",
+                )
+            return disconnected.value.code
+        finally:
+            await client.close()
+
+    assert await disconnect_code("get_screenshot") == "broker_disconnected"
+    assert await disconnect_code("get_cursor_position") == "broker_disconnected"
+    assert await disconnect_code("type") == "CLIENT_RESULT_INDETERMINATE"
+    assert await disconnect_code("future_action") == "CLIENT_RESULT_INDETERMINATE"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Unix SIGKILL/socket restart regression")

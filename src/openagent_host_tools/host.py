@@ -13,12 +13,12 @@ from typing import Any
 from .audit import AuditLedger
 from .builtins import EditorServer, FilesystemServer, ShellServer
 from .config import PluginConfigStore, PluginSpec
-from .context import current_principal
 from .consent import CONSENT_VERSION, ConsentState, ConsentStore
+from .context import current_principal
 from .idempotency import IdempotencyLedger
 from .lease import MutatingLease
-from .mcp_stdio import MCPStdioServer, PerPrincipalMCPPool
 from .manifests import build_manifest_lock
+from .mcp_stdio import MCPStdioServer, PerPrincipalMCPPool
 from .paths import HostPaths
 from .sidecars import (
     AGENT_IN_CHROME_MANIFEST,
@@ -139,9 +139,7 @@ class CapabilityHost:
             if self.consent_store.load().enabled:
                 await self._start_external_locked()
 
-    async def set_consent(
-        self, enabled: bool, *, version: int = CONSENT_VERSION
-    ) -> ConsentState:
+    async def set_consent(self, enabled: bool, *, version: int = CONSENT_VERSION) -> ConsentState:
         async with self._consent_lock:
             state = self.consent_store.set_enabled(enabled, version=version)
             if enabled:
@@ -156,9 +154,7 @@ class CapabilityHost:
                         if call_id not in self._uncancellable_active:
                             task.cancel()
                     if self._active:
-                        await asyncio.gather(
-                            *self._active.values(), return_exceptions=True
-                        )
+                        await asyncio.gather(*self._active.values(), return_exceptions=True)
                     for principal in list(self._principals):
                         await self._release_principal_admitted(principal)
                     await self._stop_external_locked()
@@ -276,9 +272,7 @@ class CapabilityHost:
             try:
                 awaited = asyncio.shield(task) if cancellation_requires_drain else task
                 result = (
-                    await asyncio.wait_for(awaited, timeout=timeout)
-                    if timeout
-                    else await awaited
+                    await asyncio.wait_for(awaited, timeout=timeout) if timeout else await awaited
                 )
             except HostError as exc:
                 if not safe_retry and server in self._external_names:
@@ -324,9 +318,7 @@ class CapabilityHost:
                             principal, effective_idempotency_key
                         )
                     else:
-                        await self.idempotency.abandon(
-                            principal, effective_idempotency_key
-                        )
+                        await self.idempotency.abandon(principal, effective_idempotency_key)
                 await self.audit.append(
                     call_id=call_id,
                     principal=principal,
@@ -337,9 +329,7 @@ class CapabilityHost:
                     argument_keys=list(args),
                     duration_ms=int((time.monotonic() - started) * 1000),
                     error_code=(
-                        "CLIENT_RESULT_INDETERMINATE"
-                        if not safe_retry
-                        else "deadline_exceeded"
+                        "CLIENT_RESULT_INDETERMINATE" if not safe_retry else "deadline_exceeded"
                     ),
                     arguments_sha256=actual_arguments_hash,
                 )
@@ -368,9 +358,7 @@ class CapabilityHost:
                             principal, effective_idempotency_key
                         )
                     else:
-                        await self.idempotency.abandon(
-                            principal, effective_idempotency_key
-                        )
+                        await self.idempotency.abandon(principal, effective_idempotency_key)
                 await self.audit.append(
                     call_id=call_id,
                     principal=principal,
@@ -380,11 +368,7 @@ class CapabilityHost:
                     outcome="cancelled" if safe_retry else "indeterminate",
                     argument_keys=list(args),
                     duration_ms=int((time.monotonic() - started) * 1000),
-                    error_code=(
-                        "CLIENT_RESULT_INDETERMINATE"
-                        if not safe_retry
-                        else "cancelled"
-                    ),
+                    error_code=("CLIENT_RESULT_INDETERMINATE" if not safe_retry else "cancelled"),
                     arguments_sha256=actual_arguments_hash,
                 )
                 if not safe_retry:
@@ -516,9 +500,11 @@ class CapabilityHost:
                 provider = self._servers.get(server)
                 manifest = provider.manifest if provider is not None else None
                 tool_manifest = manifest.tool(tool) if manifest is not None else None
-                if provider is None or tool_manifest is None or not self._health.get(
-                    server, {}
-                ).get("available", True):
+                if (
+                    provider is None
+                    or tool_manifest is None
+                    or not self._health.get(server, {}).get("available", True)
+                ):
                     await self._audit_denial(
                         call_id, principal, server, tool, args, "tool_not_found"
                     )
@@ -528,6 +514,16 @@ class CapabilityHost:
                         {"server": server, "tool": tool},
                     )
 
+                tool_manifest = replace(
+                    tool_manifest,
+                    classification=tool_manifest.classification_for(args),
+                )
+                if server == "agent-in-chrome":
+                    try:
+                        _require_browser_network_context(principal)
+                    except HostError as exc:
+                        await self._audit_denial(call_id, principal, server, tool, args, exc.code)
+                        raise
                 if server == "computer-control" and args.get("action") in {
                     "start_screen_recording",
                     "stop_screen_recording",
@@ -547,9 +543,7 @@ class CapabilityHost:
                             "screen recording belongs to a different local client account",
                         )
 
-                mutating = (
-                    tool_manifest.classification != ToolClassification.READ_ONLY
-                )
+                mutating = tool_manifest.classification != ToolClassification.READ_ONLY
                 safe_retry = tool_manifest.classification in {
                     ToolClassification.READ_ONLY,
                     ToolClassification.IDEMPOTENT,
@@ -640,9 +634,7 @@ class CapabilityHost:
                     finally:
                         current_principal.reset(token)
 
-                task = asyncio.create_task(
-                    invoke_provider(), name=f"local-tool-{call_id}"
-                )
+                task = asyncio.create_task(invoke_provider(), name=f"local-tool-{call_id}")
                 done_event = asyncio.Event()
                 self._active[call_id] = task
                 self._active_principals[call_id] = principal
@@ -672,9 +664,7 @@ class CapabilityHost:
                     if lease_entered:
                         await self.lease.leave(principal, call_id)
                     if claimed and effective_idempotency_key:
-                        await self.idempotency.abandon(
-                            principal, effective_idempotency_key
-                        )
+                        await self.idempotency.abandon(principal, effective_idempotency_key)
 
     async def cancel(self, call_id: str) -> bool:
         # If the call is still waiting in ledger/lease admission, wait until it
@@ -726,9 +716,7 @@ class CapabilityHost:
     async def _finish_principal_release(
         self,
         principal_id: str,
-        active: list[
-            tuple[str, asyncio.Task[ToolResult] | None, asyncio.Event | None]
-        ],
+        active: list[tuple[str, asyncio.Task[ToolResult] | None, asyncio.Event | None]],
     ) -> None:
         waits = [done.wait() for _call_id, _task, done in active if done is not None]
         if waits:
@@ -775,9 +763,7 @@ class CapabilityHost:
     def unsubscribe_events(self, sink) -> None:
         self._event_sinks.discard(sink)
 
-    async def ack_event(
-        self, principal: str | dict[str, Any], shell_id: str
-    ) -> bool:
+    async def ack_event(self, principal: str | dict[str, Any], shell_id: str) -> bool:
         """Forget one terminal event only after the Gateway accepted it."""
 
         principal_id = _principal_id(principal)
@@ -888,9 +874,7 @@ class CapabilityHost:
         self._inventory[spec.name] = adapter.manifest
         self._health[spec.name] = {"available": True, "reason": None, "source": source}
 
-    async def _start_chrome_pool(
-        self, spec: PluginSpec, *, placeholder: ServerManifest
-    ) -> None:
+    async def _start_chrome_pool(self, spec: PluginSpec, *, placeholder: ServerManifest) -> None:
         adapter = PerPrincipalMCPPool(
             spec,
             placeholder=placeholder,
@@ -914,7 +898,7 @@ class CapabilityHost:
         self._health[spec.name] = {
             "available": True,
             "reason": None,
-            "source": "sidecar-per-account",
+            "source": "sidecar-per-network-account",
         }
 
     async def _stop_external_locked(self) -> None:
@@ -935,9 +919,7 @@ class CapabilityHost:
         self._external_names.clear()
         self._external_started = False
 
-    async def _renew_call(
-        self, principal: str, call_id: str, idempotency_key: str | None
-    ) -> None:
+    async def _renew_call(self, principal: str, call_id: str, idempotency_key: str | None) -> None:
         interval = max(1.0, self.lease.lease_seconds / 3)
         while True:
             await asyncio.sleep(interval)
@@ -1019,6 +1001,25 @@ def _principal_id(value: str | dict[str, Any]) -> str:
             raise HostError("invalid_principal", "principal.client_instance_id is required")
         return json.dumps(allowed, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     raise HostError("invalid_principal", "principal must be a string or object")
+
+
+def _require_browser_network_context(principal: str) -> None:
+    try:
+        value = json.loads(principal)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise HostError(
+            "network_context_required",
+            "agent-in-chrome requires a certified network id",
+        ) from exc
+    if (
+        not isinstance(value, dict)
+        or not isinstance(value.get("network_id"), (str, int))
+        or not str(value.get("network_id")).strip()
+    ):
+        raise HostError(
+            "network_context_required",
+            "agent-in-chrome requires a certified network id",
+        )
 
 
 def _mark_client_local(result: ToolResult) -> None:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import shlex
 import subprocess
@@ -13,10 +12,14 @@ from pathlib import Path
 import pytest
 
 from openagent_host_tools import CapabilityHost, HostError, HostPaths
-from openagent_host_tools.config import PluginConfigStore, PluginSpec
-from openagent_host_tools.lease import MutatingLease
-from openagent_host_tools.idempotency import IdempotencyLedger
 from openagent_host_tools.builtins import FilesystemServer
+from openagent_host_tools.config import PluginConfigStore, PluginSpec
+from openagent_host_tools.idempotency import IdempotencyLedger
+from openagent_host_tools.lease import MutatingLease
+from openagent_host_tools.sidecars import (
+    AGENT_IN_CHROME_MANIFEST,
+    COMPUTER_CONTROL_MANIFEST,
+)
 from openagent_host_tools.types import (
     ServerManifest,
     ToolClassification,
@@ -190,9 +193,7 @@ async def test_revocation_rejects_calls_and_is_shared(paths: HostPaths, tmp_path
         assert two.consent().enabled is True
         await two.set_consent(False)
         with pytest.raises(HostError) as exc:
-            await one.call(
-                "filesystem", "list_directory", {"path": str(tmp_path)}, principal="one"
-            )
+            await one.call("filesystem", "list_directory", {"path": str(tmp_path)}, principal="one")
         assert exc.value.code == "consent_required"
     finally:
         await one.close()
@@ -264,6 +265,202 @@ async def test_mutating_lease_releases_immediately(paths: HostPaths):
     await second.enter("cli", "b", "editor.edit")
     await second.leave("cli", "b")
     assert (await first.status())["state"] == "free"
+
+
+def test_computer_control_manifest_classifies_each_action_fail_closed():
+    tool = COMPUTER_CONTROL_MANIFEST.tool("computer")
+    assert tool is not None
+    assert tool.classification == ToolClassification.MUTATING
+    assert tool.classification_for({"action": "get_screenshot"}) == ToolClassification.READ_ONLY
+    assert (
+        tool.classification_for({"action": "get_cursor_position"}) == ToolClassification.READ_ONLY
+    )
+    for action in (
+        "key",
+        "type",
+        "mouse_move",
+        "left_click",
+        "left_click_drag",
+        "right_click",
+        "middle_click",
+        "double_click",
+        "scroll",
+        "start_screen_recording",
+        "stop_screen_recording",
+        "future_action",
+    ):
+        assert tool.classification_for({"action": action}) == ToolClassification.MUTATING
+    assert tool.classification_for({}) == ToolClassification.MUTATING
+    assert tool.to_wire()["classification_by_argument"] == {
+        "action": {
+            "get_cursor_position": "read_only",
+            "get_screenshot": "read_only",
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_computer_control_read_actions_do_not_take_mutating_lease(
+    paths: HostPaths, tmp_path: Path
+):
+    read_started = asyncio.Event()
+    release_read = asyncio.Event()
+    mutation_started = asyncio.Event()
+    release_mutation = asyncio.Event()
+
+    class ControlledComputer:
+        manifest = COMPUTER_CONTROL_MANIFEST
+
+        async def call(self, tool, args):
+            assert tool == "computer"
+            if args["action"] == "get_screenshot":
+                read_started.set()
+                await release_read.wait()
+            elif args["action"] == "type":
+                mutation_started.set()
+                await release_mutation.wait()
+            return ToolResult.text("ok")
+
+        async def close(self):
+            return None
+
+    host = CapabilityHost(paths=paths, cwd=tmp_path)
+    await host.start()
+    await host.set_consent(True)
+    host._servers["computer-control"] = ControlledComputer()
+    host._inventory["computer-control"] = COMPUTER_CONTROL_MANIFEST
+    host._health["computer-control"] = {"available": True, "source": "test"}
+    read_call = asyncio.create_task(
+        host.call(
+            "computer-control",
+            "computer",
+            {"action": "get_screenshot"},
+            principal="reader",
+            call_id="computer-read",
+        )
+    )
+    mutation_call = None
+    try:
+        await asyncio.wait_for(read_started.wait(), timeout=1)
+        assert (await host.lease.status())["state"] == "free"
+        await host.call(
+            "filesystem",
+            "write_file",
+            {"path": str(tmp_path / "during-read.txt"), "content": "ok"},
+            principal="writer",
+            call_id="write-during-computer-read",
+        )
+        release_read.set()
+        read_result = await read_call
+        assert read_result.meta["openagent/idempotent"] is True
+        read_audit = next(
+            item for item in await host.audit.recent() if item["call_id"] == "computer-read"
+        )
+        assert read_audit["classification"] == "read_only"
+
+        mutation_call = asyncio.create_task(
+            host.call(
+                "computer-control",
+                "computer",
+                {"action": "type", "text": "hello"},
+                principal="controller",
+                call_id="computer-mutation",
+            )
+        )
+        await asyncio.wait_for(mutation_started.wait(), timeout=1)
+        lease = await host.lease.status()
+        assert lease["state"] == "held"
+        assert lease["inflight"] == [
+            {"call_id": "computer-mutation", "tool": "computer-control.computer"}
+        ]
+        with pytest.raises(HostError) as held:
+            await host.call(
+                "filesystem",
+                "write_file",
+                {"path": str(tmp_path / "blocked.txt"), "content": "blocked"},
+                principal="writer",
+                call_id="write-during-computer-mutation",
+            )
+        assert held.value.code == "lease_held"
+        assert not (tmp_path / "blocked.txt").exists()
+        release_mutation.set()
+        await mutation_call
+    finally:
+        release_read.set()
+        release_mutation.set()
+        await asyncio.gather(
+            read_call,
+            *(item for item in (mutation_call,) if item is not None),
+            return_exceptions=True,
+        )
+        await host.close()
+
+
+@pytest.mark.asyncio
+async def test_host_rejects_browser_without_network_before_dispatch(
+    paths: HostPaths, tmp_path: Path
+):
+    class Browser:
+        manifest = AGENT_IN_CHROME_MANIFEST
+
+        def __init__(self):
+            self.calls = 0
+
+        async def call(self, tool, args):
+            del tool, args
+            self.calls += 1
+            return ToolResult.text("ok")
+
+        async def close(self):
+            return None
+
+    host = CapabilityHost(paths=paths, cwd=tmp_path)
+    await host.start()
+    await host.set_consent(True)
+    browser = Browser()
+    host._servers["agent-in-chrome"] = browser
+    host._inventory["agent-in-chrome"] = AGENT_IN_CHROME_MANIFEST
+    host._health["agent-in-chrome"] = {"available": True, "source": "test"}
+    try:
+        with pytest.raises(HostError) as missing:
+            await host.call(
+                "agent-in-chrome",
+                "tabs_context_mcp",
+                {},
+                principal={
+                    "kind": "interactive-client",
+                    "client_instance_id": "desktop",
+                    "account_id": "account-1",
+                },
+                call_id="browser-missing-network",
+            )
+        assert missing.value.code == "network_context_required"
+        assert browser.calls == 0
+        assert (await host.lease.status())["state"] == "free"
+        denial = next(
+            item
+            for item in await host.audit.recent()
+            if item["call_id"] == "browser-missing-network"
+        )
+        assert denial["outcome"] == "denied"
+        assert denial["error_code"] == "network_context_required"
+
+        result = await host.call(
+            "agent-in-chrome",
+            "tabs_context_mcp",
+            {},
+            principal={
+                "kind": "interactive-client",
+                "client_instance_id": "desktop",
+                "account_id": "account-1",
+                "network_id": "network-1",
+            },
+            call_id="browser-with-network",
+        )
+        assert result.is_error is False
+        assert browser.calls == 1
+    finally:
+        await host.close()
 
 
 @pytest.mark.asyncio
@@ -506,9 +703,7 @@ async def test_thread_backed_mutation_drains_before_cancel_returns(
 
 
 @pytest.mark.asyncio
-async def test_release_principal_never_unlocks_an_active_mutation(
-    paths: HostPaths, tmp_path: Path
-):
+async def test_release_principal_never_unlocks_an_active_mutation(paths: HostPaths, tmp_path: Path):
     started = threading.Event()
     counter_lock = threading.Lock()
     concurrent = 0

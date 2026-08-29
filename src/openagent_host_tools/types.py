@@ -19,14 +19,42 @@ class ToolManifest:
     description: str
     input_schema: dict[str, Any]
     classification: ToolClassification = ToolClassification.READ_ONLY
+    classification_by_argument: dict[str, dict[str, ToolClassification]] = field(
+        default_factory=dict
+    )
+
+    def classification_for(self, arguments: dict[str, Any]) -> ToolClassification:
+        """Resolve the conservative classification for one concrete invocation.
+
+        MCP annotations classify an entire tool, but a few canonical MCP tools
+        multiplex read-only and mutating operations behind an ``action``
+        argument. The base classification remains the fail-closed fallback for
+        missing, malformed, or newly-added argument values.
+        """
+
+        classification = self.classification
+        for argument, values in self.classification_by_argument.items():
+            value = arguments.get(argument)
+            if isinstance(value, str):
+                classification = values.get(value, classification)
+        return classification
 
     def to_wire(self) -> dict[str, Any]:
-        return {
+        value: dict[str, Any] = {
             "name": self.name,
             "description": self.description,
             "input_schema": self.input_schema,
             "classification": self.classification.value,
         }
+        if self.classification_by_argument:
+            value["classification_by_argument"] = {
+                argument: {
+                    option: classification.value
+                    for option, classification in sorted(options.items())
+                }
+                for argument, options in sorted(self.classification_by_argument.items())
+            }
+        return value
 
 
 @dataclass(frozen=True)

@@ -1,22 +1,27 @@
 from __future__ import annotations
 
-import json
 import http.server
+import json
 import shutil
 import subprocess
 import sys
 import threading
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from openagent_host_tools.config import PluginSpec
 from openagent_host_tools.context import current_principal
-from openagent_host_tools.mcp_stdio import PerPrincipalMCPPool
+from openagent_host_tools.mcp_stdio import (
+    MCPStdioServer,
+    PerPrincipalMCPPool,
+    _chrome_principal_key,
+)
 from openagent_host_tools.sidecars import AGENT_IN_CHROME_MANIFEST
+from openagent_host_tools.types import HostError, ToolClassification
 
-
-_FAKE_MCP = r'''import json, os, sys
+_FAKE_MCP = r"""import json, os, sys
 for line in sys.stdin:
     value = json.loads(line)
     request_id = value.get("id")
@@ -32,16 +37,52 @@ for line in sys.stdin:
     else:
         result = {}
     print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
-'''
+"""
 
 
-def _principal(instance: str, account: str) -> str:
+@pytest.mark.asyncio
+async def test_stdio_adapter_preserves_host_action_classification_rules(tmp_path: Path):
+    script = tmp_path / "fake_chrome_mcp.py"
+    script.write_text(_FAKE_MCP)
+    original = AGENT_IN_CHROME_MANIFEST.tool("tabs_context_mcp")
+    assert original is not None
+    placeholder = replace(
+        AGENT_IN_CHROME_MANIFEST,
+        tools=(
+            replace(
+                original,
+                classification=ToolClassification.MUTATING,
+                classification_by_argument={"mode": {"inspect": ToolClassification.READ_ONLY}},
+            ),
+        ),
+    )
+    adapter = MCPStdioServer(
+        PluginSpec("agent-in-chrome", (sys.executable, str(script))),
+        placeholder=placeholder,
+    )
+    try:
+        await adapter.start()
+        live = adapter.manifest.tool("tabs_context_mcp")
+        assert live is not None
+        # The live MCP remains authoritative for its base annotations while the
+        # host-only conditional rule survives the handshake/catalog overlay.
+        assert live.classification == ToolClassification.READ_ONLY
+        assert live.classification_for({"mode": "inspect"}) == ToolClassification.READ_ONLY
+        assert live.classification_by_argument == {
+            "mode": {"inspect": ToolClassification.READ_ONLY}
+        }
+    finally:
+        await adapter.close()
+
+
+def _principal(instance: str, network: str, account: str) -> str:
     return json.dumps(
         {
             "kind": "interactive-client",
             "client_instance_id": instance,
             "device_label": "test",
             "account_id": account,
+            "network_id": network,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -86,20 +127,12 @@ def test_browser_reuse_requires_exact_profile_ownership_marker(tmp_path: Path):
             profile.mkdir()
         port = server.server_port
         (owned / "DevToolsActivePort").write_text(f"{port}\n{endpoint_path}\n")
-        (unrelated / "DevToolsActivePort").write_text(
-            f"{port}\n/devtools/browser/someone-else\n"
-        )
-        (wrong_port / "DevToolsActivePort").write_text(
-            f"{port + 1}\n{endpoint_path}\n"
-        )
+        (unrelated / "DevToolsActivePort").write_text(f"{port}\n/devtools/browser/someone-else\n")
+        (wrong_port / "DevToolsActivePort").write_text(f"{port + 1}\n{endpoint_path}\n")
         browser_js = (
-            Path(__file__).parents[1]
-            / "sidecars"
-            / "agent-in-chrome"
-            / "host"
-            / "browser.js"
+            Path(__file__).parents[1] / "sidecars" / "agent-in-chrome" / "host" / "browser.js"
         )
-        script = r'''
+        script = r"""
 import { pathToFileURL } from "node:url";
 const browser = await import(pathToFileURL(process.argv[1]).href);
 const port = Number(process.argv[5]);
@@ -109,7 +142,7 @@ const result = {
   wrongPort: await browser.getProfileWsEndpoint(process.argv[4], port),
 };
 process.stdout.write(JSON.stringify(result));
-'''
+"""
         completed = subprocess.run(
             [
                 node,
@@ -143,13 +176,7 @@ def test_browser_runtime_has_no_mutable_snapshot_download_path():
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is required to inspect the browser runtime")
-    browser_js = (
-        Path(__file__).parents[1]
-        / "sidecars"
-        / "agent-in-chrome"
-        / "host"
-        / "browser.js"
-    )
+    browser_js = Path(__file__).parents[1] / "sidecars" / "agent-in-chrome" / "host" / "browser.js"
     source = browser_js.read_text()
     forbidden = (
         "LAST_CHANGE",
@@ -162,7 +189,7 @@ def test_browser_runtime_has_no_mutable_snapshot_download_path():
     for marker in forbidden:
         assert marker not in source, f"mutable browser download path remains: {marker}"
 
-    script = r'''
+    script = r"""
 import { pathToFileURL } from "node:url";
 const browser = await import(pathToFileURL(process.argv[1]).href);
 const result = {
@@ -170,7 +197,7 @@ const result = {
   downloadExported: typeof browser.downloadChromium !== "undefined",
 };
 process.stdout.write(JSON.stringify(result));
-'''
+"""
     completed = subprocess.run(
         [node, "--input-type=module", "--eval", script, str(browser_js)],
         check=True,
@@ -194,14 +221,8 @@ def test_crx3_verification_accepts_valid_signature_and_rejects_tampering():
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is required to exercise CRX3 signature verification")
-    browser_js = (
-        Path(__file__).parents[1]
-        / "sidecars"
-        / "agent-in-chrome"
-        / "host"
-        / "browser.js"
-    )
-    script = r'''
+    browser_js = Path(__file__).parents[1] / "sidecars" / "agent-in-chrome" / "host" / "browser.js"
+    script = r"""
 import crypto from "node:crypto";
 import { pathToFileURL } from "node:url";
 
@@ -296,7 +317,7 @@ process.stdout.write(JSON.stringify({
   wrongAlgorithmError: rejected(() => browser.verifyCrx3Package(wrongAlgorithmCrx, id)),
   invalidIdError: rejected(() => browser.verifyCrx3Package(crx, "not-an-extension-id")),
 }));
-'''
+"""
     completed = subprocess.run(
         [node, "--input-type=module", "--eval", script, str(browser_js)],
         check=True,
@@ -313,7 +334,9 @@ process.stdout.write(JSON.stringify({
 
 
 @pytest.mark.asyncio
-async def test_chrome_pool_is_per_account_and_reference_counts_instances(tmp_path: Path):
+async def test_chrome_pool_is_per_network_account_and_reference_counts_instances(
+    tmp_path: Path,
+):
     script = tmp_path / "fake_chrome_mcp.py"
     script.write_text(_FAKE_MCP)
     pool = PerPrincipalMCPPool(
@@ -322,9 +345,9 @@ async def test_chrome_pool_is_per_account_and_reference_counts_instances(tmp_pat
         data_root=tmp_path / "chrome",
     )
     await pool.start()
-    first = _principal("desktop", "network-a")
-    second = _principal("cli", "network-a")
-    other = _principal("desktop", "network-b")
+    first = _principal("desktop", "network-a", "shared-account")
+    second = _principal("cli", "network-a", "shared-account")
+    other = _principal("desktop", "network-b", "shared-account")
     try:
         token = current_principal.set(first)
         one = await pool.call("tabs_context_mcp", {})
@@ -344,9 +367,42 @@ async def test_chrome_pool_is_per_account_and_reference_counts_instances(tmp_pat
         assert one.structured_content["port"] != three.structured_content["port"]
 
         await pool.release_principal(first)
-        assert "network-a" in pool._instances
+        first_key = _chrome_principal_key(first)
+        other_key = _chrome_principal_key(other)
+        assert first_key in pool._instances
         await pool.release_principal(second)
-        assert "network-a" not in pool._instances
-        assert "network-b" in pool._instances
+        assert first_key not in pool._instances
+        assert other_key in pool._instances
     finally:
+        await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_chrome_pool_rejects_principal_without_network_context(tmp_path: Path):
+    script = tmp_path / "fake_chrome_mcp.py"
+    script.write_text(_FAKE_MCP)
+    pool = PerPrincipalMCPPool(
+        PluginSpec("agent-in-chrome", (sys.executable, str(script))),
+        placeholder=AGENT_IN_CHROME_MANIFEST,
+        data_root=tmp_path / "chrome",
+    )
+    await pool.start()
+    principal = json.dumps(
+        {
+            "kind": "interactive-client",
+            "client_instance_id": "desktop",
+            "device_label": "test",
+            "account_id": "account-a",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    token = current_principal.set(principal)
+    try:
+        with pytest.raises(HostError) as missing:
+            await pool.call("tabs_context_mcp", {})
+        assert missing.value.code == "network_context_required"
+        assert pool._instances == {}
+    finally:
+        current_principal.reset(token)
         await pool.close()

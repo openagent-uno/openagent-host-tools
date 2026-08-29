@@ -88,8 +88,7 @@ class MCPStdioServer:
             if self.placeholder is not None and server_info.get("name") != self.placeholder.name:
                 raise HostError(
                     "plugin_identity_mismatch",
-                    f"MCP {self.spec.name!r} reported serverInfo.name "
-                    f"{server_info.get('name')!r}",
+                    f"MCP {self.spec.name!r} reported serverInfo.name {server_info.get('name')!r}",
                 )
             await self._notify("notifications/initialized", {})
             listed = await asyncio.wait_for(
@@ -112,8 +111,7 @@ class MCPStdioServer:
             unavailable_reason=None,
         )
 
-    @staticmethod
-    def _tool_manifest(raw: dict[str, Any]) -> ToolManifest:
+    def _tool_manifest(self, raw: dict[str, Any]) -> ToolManifest:
         annotations = raw.get("annotations") or {}
         read_only = annotations.get("readOnlyHint") is True
         idempotent = annotations.get("idempotentHint") is True
@@ -124,11 +122,16 @@ class MCPStdioServer:
             if idempotent
             else ToolClassification.MUTATING
         )
+        name = str(raw.get("name") or "")
+        fallback = self.placeholder.tool(name) if self.placeholder is not None else None
         return ToolManifest(
-            name=str(raw.get("name") or ""),
+            name=name,
             description=str(raw.get("description") or ""),
             input_schema=dict(raw.get("inputSchema") or {"type": "object"}),
             classification=classification,
+            classification_by_argument=(
+                fallback.classification_by_argument if fallback is not None else {}
+            ),
         )
 
     async def call(self, tool: str, args: dict[str, Any]) -> ToolResult:
@@ -168,9 +171,7 @@ class MCPStdioServer:
         request_id = self._next_id
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
-        await self._send(
-            {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
-        )
+        await self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
         try:
             return await future
         except asyncio.CancelledError:
@@ -245,11 +246,11 @@ class MCPStdioServer:
 
 
 class PerPrincipalMCPPool:
-    """Lazy MCP stdio pool with an isolated persistent data plane per account.
+    """Lazy MCP stdio pool isolated by certified network and account.
 
     Agent-in-Chrome must never share a browser profile, extensions directory,
-    or CDP port between network accounts. The host's canonical principal is the
-    pool key; release closes only that principal's sidecar while retaining its
+    or CDP port between networks, even when an account identifier is reused.
+    Release closes only that network/account's sidecar while retaining its
     profile for the next connection.
     """
 
@@ -383,7 +384,23 @@ def _chrome_principal_key(principal: str | None) -> str:
             "account_context_required",
             "agent-in-chrome cannot run without an isolated account id",
         )
-    return str(value["account_id"]).strip()
+    if (
+        not isinstance(value.get("network_id"), (str, int))
+        or not str(value.get("network_id")).strip()
+    ):
+        raise HostError(
+            "network_context_required",
+            "agent-in-chrome cannot run without a certified network id",
+        )
+    return json.dumps(
+        {
+            "account_id": str(value["account_id"]).strip(),
+            "network_id": str(value["network_id"]).strip(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
 
 
 class _PortLease:

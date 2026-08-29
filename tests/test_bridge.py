@@ -35,6 +35,7 @@ async def test_gateway_bridge_uses_exact_generation_and_preserves_result(tmp_pat
         generation=7,
         device_label="test-device",
         trusted_account_id="account-1",
+        trusted_network_id="network-1",
         trusted_device_id="device-1",
         send_json=send,
     )
@@ -43,6 +44,7 @@ async def test_gateway_bridge_uses_exact_generation_and_preserves_result(tmp_pat
         assert hello["type"] == "capability_hello"
         assert hello["protocol"] == "client-capabilities/1"
         assert hello["client_instance_id"] == "cli-instance"
+        assert hello["network_id"] == "network-1"
         assert {item["name"] for item in hello["servers"]} >= {
             "filesystem",
             "editor",
@@ -68,6 +70,7 @@ async def test_gateway_bridge_uses_exact_generation_and_preserves_result(tmp_pat
                 "session_id": "session-1",
                 "idempotency_key": "list-1",
                 "account_id": "account-1",
+                "network_id": "network-1",
             }
         )
         for _ in range(100):
@@ -128,10 +131,27 @@ async def test_gateway_bridge_uses_exact_generation_and_preserves_result(tmp_pat
             if any(item.get("call_id") == "wrong-account" for item in sent):
                 break
             await asyncio.sleep(0.01)
-        account_error = next(
-            item for item in sent if item.get("call_id") == "wrong-account"
-        )
+        account_error = next(item for item in sent if item.get("call_id") == "wrong-account")
         assert account_error["error"]["code"] == "account_mismatch"
+
+        await bridge.handle(
+            {
+                "type": "client_tool_call",
+                "call_id": "wrong-network",
+                "generation": 7,
+                "server": "filesystem",
+                "tool": "list_directory",
+                "args": {"path": str(tmp_path)},
+                "account_id": "account-1",
+                "network_id": "network-2",
+            }
+        )
+        for _ in range(100):
+            if any(item.get("call_id") == "wrong-network" for item in sent):
+                break
+            await asyncio.sleep(0.01)
+        network_error = next(item for item in sent if item.get("call_id") == "wrong-network")
+        assert network_error["error"]["code"] == "network_mismatch"
 
         await bridge.handle(
             {
@@ -140,15 +160,77 @@ async def test_gateway_bridge_uses_exact_generation_and_preserves_result(tmp_pat
                 "generation": 6,
             }
         )
-        stale_cancel = next(
-            item for item in sent if item.get("call_id") == "stale-cancel"
-        )
+        stale_cancel = next(item for item in sent if item.get("call_id") == "stale-cancel")
         assert stale_cancel["error"]["code"] == "stale_generation"
         assert bridge.principal["generation"] == 7
         assert bridge.principal["device_id"] == "device-1"
     finally:
         await bridge.close()
         await host.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_bridge_requires_trusted_network_for_agent_in_chrome():
+    class BrowserHost:
+        def __init__(self):
+            self.calls = []
+
+        async def call(self, server, tool, args, **kwargs):
+            self.calls.append((server, tool, args, kwargs["principal"]))
+            return ToolResult.text("ok")
+
+        async def cancel(self, call_id):
+            del call_id
+            return False
+
+        async def release_principal(self, principal):
+            del principal
+
+    async def invoke(bridge, sent, call_id):
+        await bridge.handle(
+            {
+                "type": "client_tool_call",
+                "call_id": call_id,
+                "generation": 11,
+                "server": "agent-in-chrome",
+                "tool": "tabs_context_mcp",
+                "args": {},
+                "account_id": "account-1",
+            }
+        )
+        for _ in range(100):
+            if any(item.get("call_id") == call_id for item in sent):
+                break
+            await asyncio.sleep(0.01)
+        return next(item for item in sent if item.get("call_id") == call_id)
+
+    host = BrowserHost()
+    unbound_sent = []
+    unbound = CapabilityBridge(
+        host,
+        client_instance_id="desktop",
+        generation=11,
+        trusted_account_id="account-1",
+        send_json=unbound_sent.append,
+    )
+    rejected = await invoke(unbound, unbound_sent, "browser-unbound")
+    assert rejected["error"]["code"] == "network_context_unavailable"
+    assert host.calls == []
+
+    bound_sent = []
+    bound = CapabilityBridge(
+        host,
+        client_instance_id="desktop",
+        generation=11,
+        trusted_account_id="account-1",
+        trusted_network_id="network-1",
+        send_json=bound_sent.append,
+    )
+    accepted = await invoke(bound, bound_sent, "browser-bound")
+    assert accepted["type"] == "client_tool_result"
+    assert host.calls[0][3]["network_id"] == "network-1"
+    await unbound.close()
+    await bound.close()
 
 
 def test_cross_language_argument_hash_vectors():
@@ -160,9 +242,10 @@ def test_cross_language_argument_hash_vectors():
     ) == IdempotencyLedger.arguments_sha256({"nested": [0, {"v": 2}]})
     with pytest.raises(Exception, match="NaN"):
         IdempotencyLedger.arguments_sha256({"bad": float("nan")})
-    assert IdempotencyLedger.arguments_sha256(
-        {"x": 1.0, "nested": [-0.0, {"v": 2.0}], "text": "è"}
-    ) == "4dc3a30bb9d5c2c92d2135735330fb49b793376890a07e80b55536ad8d8d5009"
+    assert (
+        IdempotencyLedger.arguments_sha256({"x": 1.0, "nested": [-0.0, {"v": 2.0}], "text": "è"})
+        == "4dc3a30bb9d5c2c92d2135735330fb49b793376890a07e80b55536ad8d8d5009"
+    )
 
 
 @pytest.mark.asyncio
@@ -277,9 +360,7 @@ async def test_gateway_bridge_chunks_large_artifacts():
         },
     }
     assert resource_ref["artifact_insert_path"] == ["resource", "blob"]
-    image_chunks = [
-        frame for frame in chunks if frame["transfer_id"] == content_ref
-    ]
+    image_chunks = [frame for frame in chunks if frame["transfer_id"] == content_ref]
     assert image_chunks[0]["size"] == 600 * 1024
     assert b"".join(base64.b64decode(frame["data"]) for frame in image_chunks) == b"x" * (
         600 * 1024
@@ -290,10 +371,7 @@ async def test_gateway_bridge_chunks_large_artifacts():
 def test_artifact_transfer_count_is_bounded_before_gateway_dispatch():
     encoded = base64.b64encode(b"x" * (256 * 1024)).decode()
     result = {
-        "content": [
-            {"type": "image", "mimeType": "image/png", "data": encoded}
-            for _ in range(65)
-        ],
+        "content": [{"type": "image", "mimeType": "image/png", "data": encoded} for _ in range(65)],
         "isError": False,
     }
     with pytest.raises(HostError) as error:
@@ -362,9 +440,7 @@ async def test_shell_event_retries_until_ack_and_replays_after_reconnect():
         "server": "shell",
         "shell_id": "sh_event",
         "status": "completed",
-        "principal": json.dumps(
-            principal, sort_keys=True, separators=(",", ":")
-        ),
+        "principal": json.dumps(principal, sort_keys=True, separators=(",", ":")),
     }
     await host.emit(event)
     assert len([item for item in sent if item.get("type") == "client_tool_event"]) == 1
@@ -405,10 +481,7 @@ async def test_shell_event_retries_until_ack_and_replays_after_reconnect():
     assert host.acks[-1][1] == "sh_event"
     before = len(reconnected_sent)
     await second.heartbeat()
-    assert not any(
-        item.get("type") == "client_tool_event"
-        for item in reconnected_sent[before:]
-    )
+    assert not any(item.get("type") == "client_tool_event" for item in reconnected_sent[before:])
     await second.close()
 
 
@@ -538,9 +611,7 @@ async def test_bridge_close_cancels_read_claim_before_exact_reconnect_retry(
             if any(item.get("type") == "client_tool_result" for item in retry_sent):
                 break
             await asyncio.sleep(0.01)
-        result = next(
-            item for item in retry_sent if item.get("type") == "client_tool_result"
-        )
+        result = next(item for item in retry_sent if item.get("type") == "client_tool_result")
         assert result["result"]["content"][0]["text"] == "retry-ok"
     finally:
         await retry.close()
@@ -555,11 +626,7 @@ async def test_bridge_transport_reconnect_preserves_returned_background_shell(
     await host.start()
     await host.set_consent(True)
     executable = [sys.executable, "-c", "import time; time.sleep(30)"]
-    command = (
-        subprocess.list2cmdline(executable)
-        if os.name == "nt"
-        else shlex.join(executable)
-    )
+    command = subprocess.list2cmdline(executable) if os.name == "nt" else shlex.join(executable)
 
     async def call_and_result(bridge, sent, call_id, tool, args):
         await bridge.handle(
@@ -574,9 +641,7 @@ async def test_bridge_transport_reconnect_preserves_returned_background_shell(
             }
         )
         for _ in range(200):
-            match = next(
-                (item for item in sent if item.get("call_id") == call_id), None
-            )
+            match = next((item for item in sent if item.get("call_id") == call_id), None)
             if match is not None:
                 return match
             await asyncio.sleep(0.01)
@@ -611,13 +676,10 @@ async def test_bridge_transport_reconnect_preserves_returned_background_shell(
         send_json=second_sent.append,
     )
     try:
-        listed = await call_and_result(
-            second, second_sent, "background-list", "shell_list", {}
-        )
-        assert [
-            item["shell_id"]
-            for item in listed["result"]["structuredContent"]["shells"]
-        ] == [shell_id]
+        listed = await call_and_result(second, second_sent, "background-list", "shell_list", {})
+        assert [item["shell_id"] for item in listed["result"]["structuredContent"]["shells"]] == [
+            shell_id
+        ]
     finally:
         await second.close()
         await host.close()

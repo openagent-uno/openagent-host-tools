@@ -131,10 +131,7 @@ class LocalBrokerServer:
 
         async def on_event(event: dict[str, Any]) -> None:
             data = (
-                json.dumps(
-                    {"type": "event", "event": event}, separators=(",", ":")
-                )
-                + "\n"
+                json.dumps({"type": "event", "event": event}, separators=(",", ":")) + "\n"
             ).encode()
             async with writes:
                 if writer.is_closing():
@@ -149,11 +146,7 @@ class LocalBrokerServer:
                 principal = principal or "local-control-client"
                 principals[_principal_id(principal)] = principal
             reply = await dispatch_control(self.host, request)
-            if (
-                request_type == "release_principal"
-                and reply.frame.get("ok") is True
-                and principal
-            ):
+            if request_type == "release_principal" and reply.frame.get("ok") is True and principal:
                 principals.pop(_principal_id(principal), None)
             data = (json.dumps(reply.frame, separators=(",", ":")) + "\n").encode()
             async with writes:
@@ -238,9 +231,7 @@ class LocalBrokerServer:
 
         def on_event(event: dict[str, Any]) -> None:
             output.put(
-                json.dumps(
-                    {"type": "event", "event": event}, separators=(",", ":")
-                ).encode()
+                json.dumps({"type": "event", "event": event}, separators=(",", ":")).encode()
             )
 
         def writer() -> None:
@@ -451,9 +442,7 @@ def _spawn_broker(paths: HostPaths) -> None:
         "close_fds": True,
     }
     if os.name == "nt":  # pragma: no cover
-        kwargs["creationflags"] = (
-            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
-        )
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
     else:
         kwargs["start_new_session"] = True
     subprocess.Popen(command, **kwargs)
@@ -473,6 +462,7 @@ class LocalCapabilityClient:
         self._disconnect_sinks: set[Any] = set()
         self._terminal_events: dict[tuple[str, str], dict[str, Any]] = {}
         self._tool_classifications: dict[tuple[str, str], str] = {}
+        self._tool_classification_rules: dict[tuple[str, str], dict[str, dict[str, str]]] = {}
         self._next_id = 0
         self._lifecycle_lock = asyncio.Lock()
 
@@ -505,19 +495,28 @@ class LocalCapabilityClient:
         result = await self._request("catalog")
         servers = list(result.get("servers") or [])
         self._tool_classifications = {
-            (str(server.get("name") or server.get("id") or ""), str(tool.get("name") or "")):
-            str(tool.get("classification") or "mutating")
+            (str(server.get("name") or server.get("id") or ""), str(tool.get("name") or "")): str(
+                tool.get("classification") or "mutating"
+            )
             for server in servers
             if isinstance(server, dict)
             for tool in (server.get("tools") or [])
             if isinstance(tool, dict)
         }
+        self._tool_classification_rules = {
+            (
+                str(server.get("name") or server.get("id") or ""),
+                str(tool.get("name") or ""),
+            ): _wire_classification_rules(tool.get("classification_by_argument"))
+            for server in servers
+            if isinstance(server, dict)
+            for tool in (server.get("tools") or [])
+            if isinstance(tool, dict) and tool.get("classification_by_argument")
+        }
         return servers
 
     async def set_consent(self, enabled: bool, *, version: int = 1):
-        result = await self._request(
-            "set_consent", enabled=enabled, consent_version=version
-        )
+        result = await self._request("set_consent", enabled=enabled, consent_version=version)
         return result["consent"]
 
     async def call(
@@ -532,7 +531,12 @@ class LocalCapabilityClient:
         deadline_ms: int | float | None = None,
         arguments_sha256: str | None = None,
     ) -> ToolResult:
-        classification = self._tool_classifications.get((server, tool))
+        key = (server, tool)
+        classification = _classification_for_arguments(
+            self._tool_classifications.get(key, "mutating"),
+            self._tool_classification_rules.get(key, {}),
+            args,
+        )
         result = await self._request(
             "call",
             indeterminate_on_disconnect=classification == "mutating",
@@ -558,12 +562,8 @@ class LocalCapabilityClient:
             if event.get("principal") == principal_id:
                 self._terminal_events.pop(key, None)
 
-    async def ack_event(
-        self, principal: str | dict[str, Any], shell_id: str
-    ) -> bool:
-        result = await self._request(
-            "ack_event", principal=principal, shell_id=shell_id
-        )
+    async def ack_event(self, principal: str | dict[str, Any], shell_id: str) -> bool:
+        result = await self._request("ack_event", principal=principal, shell_id=shell_id)
         principal_id = _principal_id(principal)
         self._terminal_events.pop((principal_id, str(shell_id)), None)
         return bool(result.get("acknowledged"))
@@ -613,6 +613,7 @@ class LocalCapabilityClient:
         self._indeterminate_on_disconnect.clear()
         self._terminal_events.clear()
         self._tool_classifications.clear()
+        self._tool_classification_rules.clear()
 
     async def _request(
         self,
@@ -827,3 +828,28 @@ def _principal_id(value: str | dict[str, Any]) -> str:
         "generation": value.get("generation"),
     }
     return json.dumps(allowed, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _wire_classification_rules(value: Any) -> dict[str, dict[str, str]]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(argument): {
+            str(option): str(classification)
+            for option, classification in options.items()
+            if str(classification) in {"read_only", "idempotent", "mutating"}
+        }
+        for argument, options in value.items()
+        if isinstance(options, dict)
+    }
+
+
+def _classification_for_arguments(
+    base: str, rules: dict[str, dict[str, str]], arguments: dict[str, Any]
+) -> str:
+    classification = base if base in {"read_only", "idempotent", "mutating"} else "mutating"
+    for argument, options in rules.items():
+        value = arguments.get(argument)
+        if isinstance(value, str):
+            classification = options.get(value, classification)
+    return classification
