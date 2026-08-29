@@ -67,7 +67,18 @@ impl InputController {
             }
         }
 
-        let enigo = match Enigo::new(&Settings::default()) {
+        #[allow(unused_mut)]
+        let mut settings = Settings::default();
+        #[cfg(target_os = "linux")]
+        {
+            // Passing the display names explicitly avoids libxdo relying on
+            // process-global lookup internally. That lookup is unreliable in
+            // frozen helpers and on arm64 desktop sessions even though the
+            // inherited DISPLAY/WAYLAND_DISPLAY values are valid.
+            settings.x11_display = nonempty_env("DISPLAY");
+            settings.wayland_display = nonempty_env("WAYLAND_DISPLAY");
+        }
+        let enigo = match Enigo::new(&settings) {
             Ok(e) => e,
             Err(e) => {
                 #[cfg(target_os = "macos")]
@@ -185,6 +196,11 @@ impl InputController {
         }
         Ok(())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
 /// Parse the scroll `text` argument from the MCP call, e.g. "down" or "down:500".
