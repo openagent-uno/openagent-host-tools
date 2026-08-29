@@ -24,6 +24,12 @@ from .types import (
 )
 
 _MCP_PROTOCOL_VERSION = "2024-11-05"
+# MCP stdio uses one JSON-RPC message per line. A single supported 64 MiB raw
+# artifact expands to roughly 86 MiB when base64 encoded, so asyncio's 64 KiB
+# StreamReader default is far too small for screenshots and other media. Keep a
+# finite ceiling above the capability protocol's largest supported artifact to
+# avoid turning an untrusted plugin response into an unbounded buffer.
+_MAX_MCP_STDIO_LINE_BYTES = 128 * 1024 * 1024
 
 
 class MCPStdioServer:
@@ -107,6 +113,7 @@ class MCPStdioServer:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                limit=_MAX_MCP_STDIO_LINE_BYTES,
             )
         except OSError as exc:
             raise HostError(

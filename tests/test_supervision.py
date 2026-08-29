@@ -49,6 +49,12 @@ for line in sys.stdin:
                 "inputSchema": {"type": "object"},
                 "annotations": {"readOnlyHint": True},
             },
+            {
+                "name": "large_image",
+                "description": "return an image larger than asyncio's default line limit",
+                "inputSchema": {"type": "object"},
+                "annotations": {"readOnlyHint": True},
+            },
         ]})
         if os.environ.get("TEST_EXIT_AFTER_LIST") == "1":
             threading.Timer(0.03, lambda: os._exit(23)).start()
@@ -59,6 +65,14 @@ for line in sys.stdin:
             if effect:
                 pathlib.Path(effect).write_text(f"effect-{generation}")
             os._exit(17)
+        if value.get("params", {}).get("name") == "large_image":
+            payload = "A" * (256 * 1024)
+            reply(request_id, {
+                "content": [{"type": "image", "mimeType": "image/png", "data": payload}],
+                "structuredContent": {"encoded_size": len(payload)},
+                "isError": False,
+            })
+            continue
         reply(request_id, {
             "content": [{"type": "text", "text": f"generation-{generation}"}],
             "structuredContent": {"generation": generation},
@@ -79,6 +93,41 @@ async def _wait_until(predicate, *, timeout: float = 3.0) -> None:
         if asyncio.get_running_loop().time() >= deadline:
             raise AssertionError("condition did not become true")
         await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_stdio_preserves_results_larger_than_asyncio_default_line_limit(
+    tmp_path: Path,
+):
+    script = _write_mcp(tmp_path)
+    state = tmp_path / "large-result-starts.txt"
+    adapter = MCPStdioServer(
+        PluginSpec(
+            "large-result",
+            (sys.executable, str(script)),
+            env={
+                "TEST_STATE_PATH": str(state),
+                "TEST_SERVER_NAME": "large-result",
+            },
+        )
+    )
+    try:
+        await adapter.start()
+        result = await adapter.call("large_image", {})
+        assert result.is_error is False
+        assert result.structured_content == {"encoded_size": 256 * 1024}
+        assert result.content == [
+            {
+                "type": "image",
+                "mimeType": "image/png",
+                "data": "A" * (256 * 1024),
+            }
+        ]
+        assert adapter.manifest.available is True
+        assert adapter.process is not None
+        assert adapter.process.returncode is None
+    finally:
+        await adapter.close()
 
 
 @pytest.mark.asyncio
@@ -305,7 +354,11 @@ async def test_host_supervises_transient_chrome_catalog_probe_failure(
             for server in await host.catalog()
             if server["name"] == "agent-in-chrome"
         )
-        assert {tool["name"] for tool in chrome["tools"]} == {"mutate", "inspect"}
+        assert {tool["name"] for tool in chrome["tools"]} == {
+            "mutate",
+            "inspect",
+            "large_image",
+        }
     finally:
         await host.close()
 
