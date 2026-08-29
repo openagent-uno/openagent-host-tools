@@ -582,15 +582,35 @@ async def test_idempotent_plugin_broker_disconnect_is_retryable_not_indeterminat
 async def test_broker_disconnect_uses_action_level_classification(tmp_path: Path):
     class EofTransport:
         def __init__(self):
-            self.sent = asyncio.Event()
+            self.frames: asyncio.Queue[dict | None] = asyncio.Queue()
 
         async def send(self, value):
-            del value
-            self.sent.set()
+            if value["type"] == "catalog":
+                await self.frames.put({
+                    "id": value["id"],
+                    "type": "response",
+                    "ok": True,
+                    "result": {
+                        "servers": [{
+                            "name": "computer-control",
+                            "tools": [{
+                                "name": "computer",
+                                "classification": "mutating",
+                                "classification_by_argument": {
+                                    "action": {
+                                        "get_cursor_position": "read_only",
+                                        "get_screenshot": "read_only",
+                                    },
+                                },
+                            }],
+                        }],
+                    },
+                })
+            elif value["type"] == "call":
+                await self.frames.put(None)
 
         async def receive(self):
-            await self.sent.wait()
-            return None
+            return await self.frames.get()
 
         async def close(self):
             return None
@@ -599,14 +619,6 @@ async def test_broker_disconnect_uses_action_level_classification(tmp_path: Path
         client = LocalCapabilityClient(HostPaths.discover(tmp_path / action))
         transport = EofTransport()
         client._transport = transport
-        key = ("computer-control", "computer")
-        client._tool_classifications[key] = "mutating"
-        client._tool_classification_rules[key] = {
-            "action": {
-                "get_cursor_position": "read_only",
-                "get_screenshot": "read_only",
-            }
-        }
         client._listener = asyncio.create_task(client._listen(transport))
         try:
             with pytest.raises(HostError) as disconnected:
