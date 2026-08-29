@@ -126,6 +126,7 @@ class LocalBrokerServer:
     ) -> None:
         writes = asyncio.Lock()
         tasks: set[asyncio.Task[None]] = set()
+        event_buffers: dict[asyncio.Task[Any], list[bytes]] = {}
         should_close = asyncio.Event()
         principals: dict[str, str | dict[str, Any]] = {}
 
@@ -133,6 +134,10 @@ class LocalBrokerServer:
             data = (
                 json.dumps({"type": "event", "event": event}, separators=(",", ":")) + "\n"
             ).encode()
+            current = asyncio.current_task()
+            if current is not None and current in event_buffers:
+                event_buffers[current].append(data)
+                return
             async with writes:
                 if writer.is_closing():
                     return
@@ -145,17 +150,31 @@ class LocalBrokerServer:
             if request_type == "call":
                 principal = principal or "local-control-client"
                 principals[_principal_id(principal)] = principal
-            reply = await dispatch_control(self.host, request)
-            if request_type == "release_principal" and reply.frame.get("ok") is True and principal:
+            current = asyncio.current_task()
+            assert current is not None
+            buffered: list[bytes] = []
+            event_buffers[current] = buffered
+            try:
+                reply = await dispatch_control(self.host, request)
+            finally:
+                event_buffers.pop(current, None)
+            if (
+                request_type == "release_principal"
+                and reply.frame.get("ok") is True
+                and principal
+            ):
                 principals.pop(_principal_id(principal), None)
             data = (json.dumps(reply.frame, separators=(",", ":")) + "\n").encode()
             async with writes:
                 writer.write(data)
+                for event_data in buffered:
+                    writer.write(event_data)
                 await writer.drain()
             if reply.close:
                 should_close.set()
 
         self.host.subscribe_events(on_event)
+        self.host.subscribe_catalog(on_event)
         try:
             while not should_close.is_set():
                 line = await reader.readline()
@@ -175,6 +194,7 @@ class LocalBrokerServer:
                     break
         finally:
             self.host.unsubscribe_events(on_event)
+            self.host.unsubscribe_catalog(on_event)
             for task in tasks:
                 task.cancel()
             if tasks:
@@ -228,11 +248,20 @@ class LocalBrokerServer:
         output: queue.Queue[bytes | None] = queue.Queue()
         principals: dict[str, str | dict[str, Any]] = {}
         pending: set[Any] = set()
+        event_buffers: dict[asyncio.Task[Any], list[bytes]] = {}
 
         def on_event(event: dict[str, Any]) -> None:
-            output.put(
-                json.dumps({"type": "event", "event": event}, separators=(",", ":")).encode()
-            )
+            data = json.dumps(
+                {"type": "event", "event": event}, separators=(",", ":")
+            ).encode()
+            try:
+                current = asyncio.current_task()
+            except RuntimeError:
+                current = None
+            if current is not None and current in event_buffers:
+                event_buffers[current].append(data)
+            else:
+                output.put(data)
 
         def writer() -> None:
             while True:
@@ -250,7 +279,7 @@ class LocalBrokerServer:
         def done(future, request: dict[str, Any]) -> None:
             pending.discard(future)
             try:
-                reply: ControlReply = future.result()
+                reply, buffered = future.result()
                 principal = request.get("principal")
                 if (
                     request.get("type") == "release_principal"
@@ -259,6 +288,8 @@ class LocalBrokerServer:
                 ):
                     principals.pop(_principal_id(principal), None)
                 output.put(json.dumps(reply.frame, separators=(",", ":")).encode())
+                for event_data in buffered:
+                    output.put(event_data)
                 if reply.close:
                     output.put(None)
             except Exception as exc:  # noqa: BLE001
@@ -274,6 +305,21 @@ class LocalBrokerServer:
                 )
 
         self.host.subscribe_events(on_event)
+        self.host.subscribe_catalog(on_event)
+
+        async def dispatch_buffered(
+            request: dict[str, Any]
+        ) -> tuple[ControlReply, list[bytes]]:
+            current = asyncio.current_task()
+            assert current is not None
+            buffered: list[bytes] = []
+            event_buffers[current] = buffered
+            try:
+                reply = await dispatch_control(self.host, request)
+                return reply, buffered
+            finally:
+                event_buffers.pop(current, None)
+
         try:
             while True:
                 raw = conn.recv_bytes()
@@ -282,7 +328,7 @@ class LocalBrokerServer:
                     principal = request.get("principal") or "local-control-client"
                     principals[_principal_id(principal)] = principal
                 future = asyncio.run_coroutine_threadsafe(
-                    dispatch_control(self.host, request), loop
+                    dispatch_buffered(request), loop
                 )
                 pending.add(future)
                 future.add_done_callback(lambda item, req=request: done(item, req))
@@ -292,6 +338,7 @@ class LocalBrokerServer:
             pass
         finally:
             self.host.unsubscribe_events(on_event)
+            self.host.unsubscribe_catalog(on_event)
             for future in list(pending):
                 future.cancel()
             for principal in principals.values():
@@ -459,10 +506,13 @@ class LocalCapabilityClient:
         self._pending_transport: dict[str, LocalBrokerClient] = {}
         self._indeterminate_on_disconnect: set[str] = set()
         self._event_sinks: set[Any] = set()
+        self._catalog_sinks: set[Any] = set()
         self._disconnect_sinks: set[Any] = set()
         self._terminal_events: dict[tuple[str, str], dict[str, Any]] = {}
         self._tool_classifications: dict[tuple[str, str], str] = {}
         self._tool_classification_rules: dict[tuple[str, str], dict[str, dict[str, str]]] = {}
+        self._catalog_transport: LocalBrokerClient | None = None
+        self._catalog_lock = asyncio.Lock()
         self._next_id = 0
         self._lifecycle_lock = asyncio.Lock()
 
@@ -477,6 +527,10 @@ class LocalCapabilityClient:
             stale = self._transport
             self._transport = await connect_or_start_broker(self.paths)
             transport = self._transport
+            if stale is not transport:
+                self._tool_classifications.clear()
+                self._tool_classification_rules.clear()
+                self._catalog_transport = None
             self._listener = asyncio.create_task(
                 self._listen(transport), name="host-tools-broker-client"
             )
@@ -492,8 +546,11 @@ class LocalCapabilityClient:
         return await self._request("status")
 
     async def catalog(self) -> list[dict[str, Any]]:
-        result = await self._request("catalog")
-        servers = list(result.get("servers") or [])
+        return await self._load_catalog(force=True)
+
+    def _install_catalog(
+        self, servers: list[dict[str, Any]], transport: LocalBrokerClient
+    ) -> None:
         self._tool_classifications = {
             (str(server.get("name") or server.get("id") or ""), str(tool.get("name") or "")): str(
                 tool.get("classification") or "mutating"
@@ -513,7 +570,45 @@ class LocalCapabilityClient:
             for tool in (server.get("tools") or [])
             if isinstance(tool, dict) and tool.get("classification_by_argument")
         }
-        return servers
+        self._catalog_transport = transport
+
+    async def _load_catalog(self, *, force: bool = False) -> list[dict[str, Any]]:
+        async with self._catalog_lock:
+            transport = self._transport
+            if transport is None:
+                await self.start()
+                transport = self._transport
+            assert transport is not None
+            if not force and self._catalog_transport is transport:
+                return []
+            result = await self._request("catalog")
+            servers = [
+                dict(server)
+                for server in (result.get("servers") or [])
+                if isinstance(server, dict)
+            ]
+            if self._transport is transport:
+                self._install_catalog(servers, transport)
+            return servers
+
+    async def _ensure_tool_classification(
+        self,
+        server: str,
+        tool: str,
+        args: dict[str, Any],
+    ) -> str:
+        key = (server, tool)
+        classification = self._tool_classifications.get(key)
+        if classification is None:
+            await self._load_catalog()
+        # Unknown tools fail closed as mutating. The broker will still reject
+        # them before dispatch, but a transport loss after a future catalog/call
+        # race must never encourage an unsafe automatic retry.
+        return _classification_for_arguments(
+            self._tool_classifications.get(key, "mutating"),
+            self._tool_classification_rules.get(key, {}),
+            args,
+        )
 
     async def set_consent(self, enabled: bool, *, version: int = 1):
         result = await self._request("set_consent", enabled=enabled, consent_version=version)
@@ -531,12 +626,7 @@ class LocalCapabilityClient:
         deadline_ms: int | float | None = None,
         arguments_sha256: str | None = None,
     ) -> ToolResult:
-        key = (server, tool)
-        classification = _classification_for_arguments(
-            self._tool_classifications.get(key, "mutating"),
-            self._tool_classification_rules.get(key, {}),
-            args,
-        )
+        classification = await self._ensure_tool_classification(server, tool, args)
         result = await self._request(
             "call",
             indeterminate_on_disconnect=classification == "mutating",
@@ -581,6 +671,12 @@ class LocalCapabilityClient:
     def unsubscribe_events(self, sink) -> None:
         self._event_sinks.discard(sink)
 
+    def subscribe_catalog(self, sink) -> None:
+        self._catalog_sinks.add(sink)
+
+    def unsubscribe_catalog(self, sink) -> None:
+        self._catalog_sinks.discard(sink)
+
     def subscribe_disconnect(self, sink) -> None:
         self._disconnect_sinks.add(sink)
 
@@ -614,6 +710,7 @@ class LocalCapabilityClient:
         self._terminal_events.clear()
         self._tool_classifications.clear()
         self._tool_classification_rules.clear()
+        self._catalog_transport = None
 
     async def _request(
         self,
@@ -655,6 +752,28 @@ class LocalCapabilityClient:
             if frame.get("type") == "event":
                 event = frame.get("event")
                 if isinstance(event, dict):
+                    if event.get("type") == "catalog_changed":
+                        servers = event.get("servers")
+                        if (
+                            isinstance(servers, list)
+                            and self._transport is transport
+                        ):
+                            self._install_catalog(
+                                [
+                                    dict(server)
+                                    for server in servers
+                                    if isinstance(server, dict)
+                                ],
+                                transport,
+                            )
+                        for sink in list(self._catalog_sinks):
+                            try:
+                                result = sink(dict(event))
+                                if asyncio.iscoroutine(result):
+                                    await result
+                            except Exception:
+                                continue
+                        continue
                     if event.get("type") == "shell_completed" and event.get("shell_id"):
                         key = (
                             str(event.get("principal") or ""),
@@ -696,6 +815,9 @@ class LocalCapabilityClient:
             self._transport = None
             if self._listener is listener:
                 self._listener = None
+            self._tool_classifications.clear()
+            self._tool_classification_rules.clear()
+            self._catalog_transport = None
         await transport.close()
         for sink in list(self._disconnect_sinks):
             try:

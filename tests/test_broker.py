@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import shlex
@@ -624,6 +625,82 @@ async def test_broker_disconnect_uses_action_level_classification(tmp_path: Path
     assert await disconnect_code("get_cursor_position") == "broker_disconnected"
     assert await disconnect_code("type") == "CLIENT_RESULT_INDETERMINATE"
     assert await disconnect_code("future_action") == "CLIENT_RESULT_INDETERMINATE"
+
+
+@pytest.mark.asyncio
+async def test_direct_mutation_loads_catalog_before_dispatch_and_is_indeterminate(
+    tmp_path: Path,
+):
+    class CatalogThenEofTransport:
+        def __init__(self):
+            self.frames: asyncio.Queue[dict | None] = asyncio.Queue()
+            self.sent: list[dict] = []
+
+        async def send(self, value):
+            self.sent.append(dict(value))
+            if value["type"] == "catalog":
+                await self.frames.put(
+                    {
+                        "id": value["id"],
+                        "type": "response",
+                        "ok": True,
+                        "result": {
+                            "servers": [
+                                {
+                                    "name": "plugin",
+                                    "tools": [
+                                        {
+                                            "name": "mutate",
+                                            "classification": "mutating",
+                                        }
+                                    ],
+                                }
+                            ]
+                        },
+                    }
+                )
+            elif value["type"] == "call":
+                await self.frames.put(None)
+
+        async def receive(self):
+            return await self.frames.get()
+
+        async def close(self):
+            return None
+
+    paths = HostPaths.discover(tmp_path / "user")
+    client = LocalCapabilityClient(paths)
+    transport = CatalogThenEofTransport()
+    client._transport = transport
+    listener = asyncio.create_task(client._listen(transport))
+    client._listener = listener
+    args = {"path": "client-only", "content": "once"}
+    arguments_hash = hashlib.sha256(
+        json.dumps(
+            args,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    with pytest.raises(HostError) as disconnected:
+        await client.call(
+            "plugin",
+            "mutate",
+            args,
+            principal="account-a",
+            call_id="direct-mutation",
+            idempotency_key="direct-mutation-key",
+            arguments_sha256=arguments_hash,
+        )
+    assert disconnected.value.code == "CLIENT_RESULT_INDETERMINATE"
+    assert [frame["type"] for frame in transport.sent] == ["catalog", "call"]
+    dispatched = transport.sent[1]
+    assert dispatched["call_id"] == "direct-mutation"
+    assert dispatched["idempotency_key"] == "direct-mutation-key"
+    assert dispatched["arguments_sha256"] == arguments_hash
+    assert dispatched["args"] == args
+    await asyncio.gather(listener, return_exceptions=True)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Unix SIGKILL/socket restart regression")

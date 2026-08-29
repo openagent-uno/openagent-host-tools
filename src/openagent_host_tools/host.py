@@ -59,6 +59,9 @@ class CapabilityHost:
         paths: HostPaths | None = None,
         cwd: str | Path | None = None,
         lease_seconds: float = 15.0,
+        external_restart_limit: int = 5,
+        external_restart_initial_delay: float = 0.25,
+        external_restart_max_delay: float = 5.0,
     ):
         self.paths = paths or HostPaths.discover()
         self.paths.ensure()
@@ -68,7 +71,17 @@ class CapabilityHost:
         self.lease = MutatingLease(self.paths.state_db, lease_seconds=lease_seconds)
         self.audit = AuditLedger(self.paths.audit_db)
         self.cwd = Path(cwd or Path.cwd()).expanduser().resolve()
+        self.external_restart_limit = max(0, int(external_restart_limit))
+        self.external_restart_initial_delay = max(
+            0.0, float(external_restart_initial_delay)
+        )
+        self.external_restart_max_delay = max(
+            self.external_restart_initial_delay,
+            float(external_restart_max_delay),
+        )
         self._event_sinks: set[Any] = set()
+        self._catalog_sinks: set[Any] = set()
+        self._catalog_tasks: set[asyncio.Task[None]] = set()
         self._terminal_events: dict[tuple[str, str], dict[str, Any]] = {}
 
         core: list[CapabilityServer] = [
@@ -116,6 +129,8 @@ class CapabilityHost:
         }
         self._started = False
         self._external_started = False
+        self._external_stopping = False
+        self._closing = False
         self._active: dict[str, asyncio.Task[ToolResult]] = {}
         self._active_principals: dict[str, str] = {}
         self._active_mutating: set[str] = set()
@@ -158,7 +173,8 @@ class CapabilityHost:
                     for principal in list(self._principals):
                         await self._release_principal_admitted(principal)
                     await self._stop_external_locked()
-            return state
+        await self._emit_catalog_changed()
+        return state
 
     def consent(self) -> ConsentState:
         return self.consent_store.load()
@@ -763,6 +779,12 @@ class CapabilityHost:
     def unsubscribe_events(self, sink) -> None:
         self._event_sinks.discard(sink)
 
+    def subscribe_catalog(self, sink) -> None:
+        self._catalog_sinks.add(sink)
+
+    def unsubscribe_catalog(self, sink) -> None:
+        self._catalog_sinks.discard(sink)
+
     async def ack_event(self, principal: str | dict[str, Any], shell_id: str) -> bool:
         """Forget one terminal event only after the Gateway accepted it."""
 
@@ -782,6 +804,11 @@ class CapabilityHost:
                 continue
 
     async def close(self) -> None:
+        self._closing = True
+        for task in list(self._catalog_tasks):
+            task.cancel()
+        if self._catalog_tasks:
+            await asyncio.gather(*self._catalog_tasks, return_exceptions=True)
         async with self._admission_lock:
             for call_id, task in list(self._active.items()):
                 if call_id not in self._uncancellable_active:
@@ -848,7 +875,14 @@ class CapabilityHost:
     async def _start_mcp(
         self, spec: PluginSpec, *, placeholder: ServerManifest | None, source: str
     ) -> None:
-        adapter = MCPStdioServer(spec, placeholder=placeholder)
+        adapter = MCPStdioServer(
+            spec,
+            placeholder=placeholder,
+            on_state_change=self._on_external_state_change,
+            restart_limit=self.external_restart_limit,
+            restart_initial_delay=self.external_restart_initial_delay,
+            restart_max_delay=self.external_restart_max_delay,
+        )
         try:
             await adapter.start()
         except Exception as exc:  # failure isolation: one plugin never removes core tools
@@ -879,6 +913,10 @@ class CapabilityHost:
             spec,
             placeholder=placeholder,
             data_root=self.paths.internal / "agent-in-chrome",
+            on_state_change=self._on_external_state_change,
+            restart_limit=self.external_restart_limit,
+            restart_initial_delay=self.external_restart_initial_delay,
+            restart_max_delay=self.external_restart_max_delay,
         )
         try:
             await adapter.start()
@@ -902,22 +940,72 @@ class CapabilityHost:
         }
 
     async def _stop_external_locked(self) -> None:
-        for name in list(self._external_names):
-            server = self._servers.pop(name, None)
-            if server is not None:
-                await server.close()
-            manifest = self._inventory.get(name)
-            if manifest is not None:
-                self._inventory[name] = replace(
-                    manifest, available=False, unavailable_reason="local tools are disabled"
-                )
-            self._health[name] = {
-                **self._health.get(name, {}),
-                "available": False,
-                "reason": "local tools are disabled",
-            }
-        self._external_names.clear()
-        self._external_started = False
+        self._external_stopping = True
+        try:
+            for name in list(self._external_names):
+                server = self._servers.pop(name, None)
+                if server is not None:
+                    await server.close()
+                manifest = self._inventory.get(name)
+                if manifest is not None:
+                    self._inventory[name] = replace(
+                        manifest,
+                        available=False,
+                        unavailable_reason="local tools are disabled",
+                    )
+                self._health[name] = {
+                    **self._health.get(name, {}),
+                    "available": False,
+                    "reason": "local tools are disabled",
+                }
+            self._external_names.clear()
+            self._external_started = False
+        finally:
+            self._external_stopping = False
+
+    async def _on_external_state_change(self, provider: CapabilityServer) -> None:
+        """Publish one supervised MCP generation's availability atomically."""
+
+        name = provider.manifest.name
+        if (
+            self._closing
+            or self._external_stopping
+            or name not in self._external_names
+            or self._servers.get(name) is not provider
+        ):
+            return
+        manifest = provider.manifest
+        self._inventory[name] = manifest
+        self._health[name] = {
+            **self._health.get(name, {}),
+            "available": manifest.available,
+            "reason": manifest.unavailable_reason,
+        }
+        self._schedule_catalog_changed()
+
+    async def _emit_catalog_changed(self) -> None:
+        if self._closing:
+            return
+        event = {
+            "type": "catalog_changed",
+            "servers": await self.catalog(),
+        }
+        for sink in list(self._catalog_sinks):
+            try:
+                result = sink(dict(event))
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                continue
+
+    def _schedule_catalog_changed(self) -> None:
+        if self._closing:
+            return
+        task = asyncio.create_task(
+            self._emit_catalog_changed(), name="local-tool-catalog-update"
+        )
+        self._catalog_tasks.add(task)
+        task.add_done_callback(self._catalog_tasks.discard)
 
     async def _renew_call(self, principal: str, call_id: str, idempotency_key: str | None) -> None:
         interval = max(1.0, self.lease.lease_seconds / 3)

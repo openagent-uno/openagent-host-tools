@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import os
 import socket
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from ._version import __version__
 from .config import PluginSpec
@@ -32,27 +33,55 @@ class MCPStdioServer:
         *,
         placeholder: ServerManifest | None = None,
         startup_timeout: float = 20.0,
+        on_state_change: (
+            Callable[["MCPStdioServer"], Awaitable[None] | None] | None
+        ) = None,
+        restart_limit: int = 5,
+        restart_initial_delay: float = 0.25,
+        restart_max_delay: float = 5.0,
     ):
         self.spec = spec
         self.placeholder = placeholder
         self.startup_timeout = startup_timeout
+        self.on_state_change = on_state_change
+        self.restart_limit = max(0, int(restart_limit))
+        self.restart_initial_delay = max(0.0, float(restart_initial_delay))
+        self.restart_max_delay = max(
+            self.restart_initial_delay, float(restart_max_delay)
+        )
         self.manifest = placeholder or ServerManifest(spec.name, "unknown", "", ())
         self.process: asyncio.subprocess.Process | None = None
         self._reader: asyncio.Task[None] | None = None
         self._stderr_reader: asyncio.Task[None] | None = None
+        self._watcher: asyncio.Task[None] | None = None
+        self._restart_task: asyncio.Task[None] | None = None
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
+        self._pending_process: dict[int, asyncio.subprocess.Process] = {}
         self._write_lock = asyncio.Lock()
+        self._spawn_lock = asyncio.Lock()
         self._next_id = 0
         self._stderr_tail = ""
+        self._closing = False
+        self._expected_exits: set[asyncio.subprocess.Process] = set()
+        self._ready_processes: set[asyncio.subprocess.Process] = set()
+        self._restart_attempts = 0
+        self._restart_requested = False
         self.raw_initialize: dict[str, Any] | None = None
 
     async def start(self) -> None:
-        if self.process is not None:
-            return
+        async with self._spawn_lock:
+            if self.process is not None and self.process.returncode is None:
+                return
+            self._closing = False
+            self._restart_attempts = 0
+            self._restart_requested = False
+            await self._launch()
+
+    async def _launch(self) -> None:
         env = os.environ.copy()
         env.update(self.spec.env)
         try:
-            self.process = await asyncio.create_subprocess_exec(
+            process = await asyncio.create_subprocess_exec(
                 *self.spec.command,
                 cwd=self.spec.cwd,
                 env=env,
@@ -64,9 +93,16 @@ class MCPStdioServer:
             raise HostError(
                 "plugin_unavailable", f"cannot start MCP {self.spec.name!r}: {exc}"
             ) from exc
-        self._reader = asyncio.create_task(self._read_loop(), name=f"mcp-read-{self.spec.name}")
+        self.process = process
+        self._stderr_tail = ""
+        self._reader = asyncio.create_task(
+            self._read_loop(process), name=f"mcp-read-{self.spec.name}"
+        )
         self._stderr_reader = asyncio.create_task(
-            self._read_stderr(), name=f"mcp-stderr-{self.spec.name}"
+            self._read_stderr(process), name=f"mcp-stderr-{self.spec.name}"
+        )
+        self._watcher = asyncio.create_task(
+            self._watch_process(process), name=f"mcp-watch-{self.spec.name}"
         )
         try:
             initialized = await asyncio.wait_for(
@@ -94,8 +130,8 @@ class MCPStdioServer:
             listed = await asyncio.wait_for(
                 self._request("tools/list", {}), timeout=self.startup_timeout
             )
-        except Exception:
-            await self.close()
+        except BaseException:
+            await self._stop_process(process)
             raise
         server_info = initialized.get("serverInfo") or {}
         tools = tuple(self._tool_manifest(raw) for raw in listed.get("tools", []))
@@ -110,6 +146,10 @@ class MCPStdioServer:
             available=True,
             unavailable_reason=None,
         )
+        if self.process is not process or process.returncode is not None:
+            await self._stop_process(process)
+            raise HostError("plugin_disconnected", self._disconnect_message())
+        self._ready_processes.add(process)
 
     def _tool_manifest(self, raw: dict[str, Any]) -> ToolManifest:
         annotations = raw.get("annotations") or {}
@@ -141,9 +181,38 @@ class MCPStdioServer:
         return ToolResult.from_wire(result)
 
     async def close(self) -> None:
+        self._closing = True
+        restart = self._restart_task
+        if restart is not None and restart is not asyncio.current_task():
+            restart.cancel()
+            await asyncio.gather(restart, return_exceptions=True)
+        self._restart_task = None
         process = self.process
-        self.process = None
-        if process is not None and process.returncode is None:
+        if process is not None:
+            await self._stop_process(process)
+        else:
+            self._fail_pending()
+        for task in (self._reader, self._stderr_reader, self._watcher):
+            if task is not None and task is not asyncio.current_task() and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(
+                task
+                for task in (self._reader, self._stderr_reader, self._watcher)
+                if task is not None and task is not asyncio.current_task()
+            ),
+            return_exceptions=True,
+        )
+        self._reader = None
+        self._stderr_reader = None
+        self._watcher = None
+
+    async def _stop_process(self, process: asyncio.subprocess.Process) -> None:
+        self._expected_exits.add(process)
+        self._ready_processes.discard(process)
+        if self.process is process:
+            self.process = None
+        if process.returncode is None:
             try:
                 process.terminate()
             except ProcessLookupError:
@@ -156,47 +225,86 @@ class MCPStdioServer:
                 except ProcessLookupError:
                     pass
                 await process.wait()
-        for task in (self._reader, self._stderr_reader):
-            if task is not None and not task.done():
-                task.cancel()
-        for future in self._pending.values():
-            if not future.done():
-                future.set_exception(HostError("plugin_disconnected", self._disconnect_message()))
-        self._pending.clear()
+        watcher = self._watcher
+        if watcher is not None and watcher is not asyncio.current_task():
+            await asyncio.gather(watcher, return_exceptions=True)
+        self._expected_exits.discard(process)
+        self._fail_pending(process)
 
     async def _request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        if self.process is None or self.process.stdin is None:
+        process = self.process
+        if process is None or process.stdin is None:
             raise HostError("plugin_disconnected", self._disconnect_message())
         self._next_id += 1
         request_id = self._next_id
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
-        await self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+        self._pending_process[request_id] = process
         try:
+            await self._send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": params,
+                },
+                process=process,
+            )
             return await future
         except asyncio.CancelledError:
-            await self._notify("notifications/cancelled", {"requestId": request_id})
+            try:
+                await self._notify(
+                    "notifications/cancelled",
+                    {"requestId": request_id},
+                    process=process,
+                )
+            except HostError:
+                pass
             raise
         finally:
             self._pending.pop(request_id, None)
+            self._pending_process.pop(request_id, None)
+            if not future.done():
+                future.cancel()
 
-    async def _notify(self, method: str, params: dict[str, Any]) -> None:
-        await self._send({"jsonrpc": "2.0", "method": method, "params": params})
+    async def _notify(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        process: asyncio.subprocess.Process | None = None,
+    ) -> None:
+        await self._send(
+            {"jsonrpc": "2.0", "method": method, "params": params},
+            process=process,
+        )
 
-    async def _send(self, value: dict[str, Any]) -> None:
-        process = self.process
-        if process is None or process.stdin is None or process.returncode is not None:
+    async def _send(
+        self,
+        value: dict[str, Any],
+        *,
+        process: asyncio.subprocess.Process | None = None,
+    ) -> None:
+        target = process or self.process
+        if (
+            target is None
+            or target is not self.process
+            or target.stdin is None
+            or target.returncode is not None
+        ):
             raise HostError("plugin_disconnected", self._disconnect_message())
         data = (json.dumps(value, separators=(",", ":")) + "\n").encode()
         async with self._write_lock:
-            process.stdin.write(data)
-            await process.stdin.drain()
+            if target is not self.process or target.returncode is not None:
+                raise HostError("plugin_disconnected", self._disconnect_message())
+            target.stdin.write(data)
+            await target.stdin.drain()
 
-    async def _read_loop(self) -> None:
-        assert self.process is not None and self.process.stdout is not None
+    async def _read_loop(self, process: asyncio.subprocess.Process) -> None:
+        assert process.stdout is not None
         try:
             while True:
-                line = await self.process.stdout.readline()
+                line = await process.stdout.readline()
                 if not line:
                     break
                 try:
@@ -207,7 +315,11 @@ class MCPStdioServer:
                 if request_id is None:
                     continue
                 future = self._pending.get(int(request_id))
-                if future is None or future.done():
+                if (
+                    future is None
+                    or future.done()
+                    or self._pending_process.get(int(request_id)) is not process
+                ):
                     continue
                 if "error" in value:
                     error = value.get("error") or {}
@@ -223,22 +335,115 @@ class MCPStdioServer:
         except asyncio.CancelledError:
             raise
         finally:
-            for future in self._pending.values():
-                if not future.done():
-                    future.set_exception(
-                        HostError("plugin_disconnected", self._disconnect_message())
-                    )
+            self._fail_pending(process)
 
-    async def _read_stderr(self) -> None:
-        assert self.process is not None and self.process.stderr is not None
+    async def _read_stderr(self, process: asyncio.subprocess.Process) -> None:
+        assert process.stderr is not None
         try:
             while True:
-                chunk = await self.process.stderr.read(4096)
+                chunk = await process.stderr.read(4096)
                 if not chunk:
                     break
                 self._stderr_tail = (self._stderr_tail + chunk.decode(errors="replace"))[-8192:]
         except asyncio.CancelledError:
             raise
+
+    async def _watch_process(self, process: asyncio.subprocess.Process) -> None:
+        returncode = await process.wait()
+        expected = process in self._expected_exits
+        was_ready = process in self._ready_processes
+        self._expected_exits.discard(process)
+        self._ready_processes.discard(process)
+        if self.process is process:
+            self.process = None
+        self._fail_pending(process)
+        # A process that never completed initialize/tools-list is a failed
+        # launch, not a runtime death. Its caller owns retry policy.
+        if expected or self._closing or not was_ready:
+            return
+        reason = self._disconnect_message()
+        if returncode is not None:
+            reason = f"{reason} (exit {returncode})"
+        self.manifest = replace(
+            self.manifest, available=False, unavailable_reason=reason
+        )
+        await self._notify_state_change()
+        if self._restart_attempts >= self.restart_limit:
+            return
+        if self._restart_task is not None and not self._restart_task.done():
+            self._restart_requested = True
+        else:
+            self._restart_task = asyncio.create_task(
+                self._restart_loop(), name=f"mcp-restart-{self.spec.name}"
+            )
+
+    async def _restart_loop(self) -> None:
+        try:
+            while self._restart_attempts < self.restart_limit:
+                attempt = self._restart_attempts + 1
+                delay = min(
+                    self.restart_max_delay,
+                    self.restart_initial_delay * (2 ** (attempt - 1)),
+                )
+                if delay:
+                    await asyncio.sleep(delay)
+                if self._closing:
+                    return
+                self._restart_attempts = attempt
+                self._restart_requested = False
+                try:
+                    async with self._spawn_lock:
+                        if self._closing:
+                            return
+                        if self.process is not None and self.process.returncode is None:
+                            return
+                        await self._launch()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - health records exact failure
+                    self.manifest = replace(
+                        self.manifest,
+                        available=False,
+                        unavailable_reason=(
+                            f"MCP {self.spec.name!r} restart {attempt}/"
+                            f"{self.restart_limit} failed: {exc}"
+                        ),
+                    )
+                    await self._notify_state_change()
+                    continue
+                await self._notify_state_change()
+                # A sidecar can finish its handshake and die immediately. Let
+                # its watcher run, then consume the same bounded restart budget
+                # instead of losing the death while this task is still active.
+                await asyncio.sleep(0)
+                if self._restart_requested or self.process is None:
+                    continue
+                return
+        finally:
+            if self._restart_task is asyncio.current_task():
+                self._restart_task = None
+
+    def _fail_pending(
+        self, process: asyncio.subprocess.Process | None = None
+    ) -> None:
+        for request_id, future in self._pending.items():
+            if process is not None and self._pending_process.get(request_id) is not process:
+                continue
+            if not future.done():
+                future.set_exception(
+                    HostError("plugin_disconnected", self._disconnect_message())
+                )
+
+    async def _notify_state_change(self) -> None:
+        if self.on_state_change is None:
+            return
+        try:
+            result = self.on_state_change(self)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            # A UI/catalog observer cannot take down supervision itself.
+            return
 
     def _disconnect_message(self) -> str:
         suffix = f": {self._stderr_tail.strip()}" if self._stderr_tail.strip() else ""
@@ -260,11 +465,21 @@ class PerPrincipalMCPPool:
         *,
         placeholder: ServerManifest,
         data_root: str | Path,
+        on_state_change: (
+            Callable[["PerPrincipalMCPPool"], Awaitable[None] | None] | None
+        ) = None,
+        restart_limit: int = 5,
+        restart_initial_delay: float = 0.25,
+        restart_max_delay: float = 5.0,
     ):
         self.spec = spec
         self.placeholder = placeholder
         self.data_root = Path(data_root).expanduser().resolve()
         self.data_root.mkdir(parents=True, exist_ok=True)
+        self.on_state_change = on_state_change
+        self.restart_limit = restart_limit
+        self.restart_initial_delay = restart_initial_delay
+        self.restart_max_delay = restart_max_delay
         self.manifest = replace(
             placeholder,
             available=True,
@@ -275,12 +490,14 @@ class PerPrincipalMCPPool:
         self._ports: dict[str, _PortLease] = {}
         self._principal_accounts: dict[str, str] = {}
         self._account_principals: dict[str, set[str]] = {}
+        self._instance_health: dict[str, bool] = {}
         self._guard = asyncio.Lock()
+        self._closing = False
 
     async def start(self) -> None:
         """Probe the real MCP handshake/catalog in an isolated throwaway slot."""
         probe_key = "catalog-probe"
-        adapter, lease = self._build(probe_key)
+        adapter, lease = self._build(probe_key, supervise=False)
         try:
             await adapter.start()
             self.manifest = replace(
@@ -308,13 +525,16 @@ class PerPrincipalMCPPool:
                 try:
                     await adapter.start()
                 except Exception:
+                    await adapter.close()
                     lease.close()
                     raise
                 self._instances[key] = adapter
                 self._ports[key] = lease
+                self._instance_health[key] = True
         return await adapter.call(tool, args)
 
     async def release_principal(self, principal: str) -> None:
+        notify = False
         async with self._guard:
             key = self._principal_accounts.pop(principal, None)
             if key is None:
@@ -327,12 +547,17 @@ class PerPrincipalMCPPool:
                 self._account_principals.pop(key, None)
             adapter = self._instances.pop(key, None)
             lease = self._ports.pop(key, None)
+            self._instance_health.pop(key, None)
+            notify = self._refresh_health_locked()
         if adapter is not None:
             await adapter.close()
         if lease is not None:
             lease.close()
+        if notify:
+            await self._notify_state_change()
 
     async def close(self) -> None:
+        self._closing = True
         async with self._guard:
             instances = list(self._instances.values())
             leases = list(self._ports.values())
@@ -340,11 +565,14 @@ class PerPrincipalMCPPool:
             self._ports.clear()
             self._principal_accounts.clear()
             self._account_principals.clear()
+            self._instance_health.clear()
         await asyncio.gather(*(adapter.close() for adapter in instances), return_exceptions=True)
         for lease in leases:
             lease.close()
 
-    def _build(self, key: str) -> tuple[MCPStdioServer, "_PortLease"]:
+    def _build(
+        self, key: str, *, supervise: bool = True
+    ) -> tuple[MCPStdioServer, "_PortLease"]:
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
         principal_root = self.data_root / "principals" / digest[:24]
         profile = principal_root / "profile"
@@ -359,7 +587,67 @@ class PerPrincipalMCPPool:
             "OPENAGENT_CHROME_CDP_PORT": str(lease.port),
         }
         isolated = replace(self.spec, env=env)
-        return MCPStdioServer(isolated, placeholder=self.placeholder), lease
+
+        async def state_change(adapter: MCPStdioServer) -> None:
+            await self._instance_state_changed(key, adapter)
+
+        return (
+            MCPStdioServer(
+                isolated,
+                placeholder=self.placeholder,
+                on_state_change=state_change if supervise else None,
+                restart_limit=self.restart_limit if supervise else 0,
+                restart_initial_delay=self.restart_initial_delay,
+                restart_max_delay=self.restart_max_delay,
+            ),
+            lease,
+        )
+
+    async def _instance_state_changed(
+        self, key: str, adapter: MCPStdioServer
+    ) -> None:
+        if self._closing:
+            return
+        async with self._guard:
+            if self._instances.get(key) is not adapter:
+                return
+            self._instance_health[key] = adapter.manifest.available
+            changed = self._refresh_health_locked()
+        if changed:
+            await self._notify_state_change()
+
+    def _refresh_health_locked(self) -> bool:
+        available = all(self._instance_health.values())
+        reason = None
+        if not available:
+            reason = next(
+                (
+                    instance.manifest.unavailable_reason
+                    for instance_key, instance in self._instances.items()
+                    if not self._instance_health.get(instance_key, True)
+                ),
+                "agent-in-chrome sidecar is unavailable",
+            )
+        changed = (
+            self.manifest.available != available
+            or self.manifest.unavailable_reason != reason
+        )
+        self.manifest = replace(
+            self.manifest,
+            available=available,
+            unavailable_reason=reason,
+        )
+        return changed
+
+    async def _notify_state_change(self) -> None:
+        if self.on_state_change is None:
+            return
+        try:
+            result = self.on_state_change(self)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            return
 
 
 def _chrome_principal_key(principal: str | None) -> str:

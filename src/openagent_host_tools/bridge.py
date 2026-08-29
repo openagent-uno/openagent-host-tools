@@ -70,6 +70,7 @@ class CapabilityBridge:
         self._calls: dict[str, asyncio.Task[None]] = {}
         self._principals: dict[tuple[str | None, str], dict[str, Any]] = {}
         self._events_subscribed = False
+        self._catalog_subscribed = False
         self._disconnect_subscribed = False
         self._transport_lost = False
         self._pending_events: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -98,15 +99,20 @@ class CapabilityBridge:
         if hasattr(self.host, "subscribe_events") and not self._events_subscribed:
             self.host.subscribe_events(self._on_host_event)
             self._events_subscribed = True
+        if hasattr(self.host, "subscribe_catalog") and not self._catalog_subscribed:
+            self.host.subscribe_catalog(self._on_catalog_changed)
+            self._catalog_subscribed = True
         if hasattr(self.host, "subscribe_disconnect") and not self._disconnect_subscribed:
             self.host.subscribe_disconnect(self._on_host_disconnect)
             self._disconnect_subscribed = True
 
-    async def catalog_update(self) -> dict[str, Any]:
+    async def catalog_update(
+        self, servers: list[dict[str, Any]] | None = None
+    ) -> dict[str, Any]:
         frame = {
             "type": "capability_catalog_update",
             "generation": self.generation,
-            "servers": await self.host.catalog(),
+            "servers": await self.host.catalog() if servers is None else servers,
         }
         await self._send(frame)
         return frame
@@ -175,6 +181,9 @@ class CapabilityBridge:
         if self._events_subscribed and hasattr(self.host, "unsubscribe_events"):
             self.host.unsubscribe_events(self._on_host_event)
             self._events_subscribed = False
+        if self._catalog_subscribed and hasattr(self.host, "unsubscribe_catalog"):
+            self.host.unsubscribe_catalog(self._on_catalog_changed)
+            self._catalog_subscribed = False
         if self._disconnect_subscribed and hasattr(self.host, "unsubscribe_disconnect"):
             self.host.unsubscribe_disconnect(self._on_host_disconnect)
             self._disconnect_subscribed = False
@@ -197,6 +206,9 @@ class CapabilityBridge:
                 await self.host.release_principal(principal)
 
     async def _on_host_event(self, event: dict[str, Any]) -> None:
+        if event.get("type") == "catalog_changed":
+            await self._on_catalog_changed(event)
+            return
         principal = event.get("principal")
         if principal:
             try:
@@ -226,6 +238,13 @@ class CapabilityBridge:
         while len(self._pending_events) > MAX_PENDING_EVENTS:
             self._pending_events.popitem(last=False)
         await self._send(frame)
+
+    async def _on_catalog_changed(self, event: dict[str, Any]) -> None:
+        servers = event.get("servers")
+        if isinstance(servers, list) and all(
+            isinstance(server, dict) for server in servers
+        ):
+            await self.catalog_update(list(servers))
 
     async def _on_host_disconnect(self) -> None:
         self._transport_lost = True
