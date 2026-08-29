@@ -184,8 +184,8 @@ function httpGetJson(url, timeout = 1500) {
   });
 }
 
-export async function getWsEndpoint(port = CDP_PORT) {
-  const info = await httpGetJson(`http://127.0.0.1:${port}/json/version`);
+export async function getWsEndpoint(port = CDP_PORT, timeout = 1500) {
+  const info = await httpGetJson(`http://127.0.0.1:${port}/json/version`, timeout);
   if (info && info.webSocketDebuggerUrl && info.Browser) return info.webSocketDebuggerUrl;
   return null;
 }
@@ -321,6 +321,44 @@ function killGroup(pid) {
   try { process.kill(-pid, "SIGKILL"); } catch {
     try { process.kill(pid, "SIGKILL"); } catch {}
   }
+}
+
+/**
+ * Close the browser belonging to this exact dedicated profile/port.
+ *
+ * A supervised MCP generation may attach to a Chromium process launched by
+ * the generation which crashed. In that case `ownsBrowser` is false in the
+ * process-local sense, but the endpoint is still owned by this isolated
+ * OpenAgent pool. Always request Browser.close over the verified CDP
+ * connection; the PID signal remains a fallback only for the generation which
+ * launched the process. Waiting for the endpoint prevents the pool from
+ * handing out a different port while the persistent profile is still locked.
+ */
+export async function closeDedicatedBrowser(
+  connection,
+  {
+    ownsBrowser = false,
+    browserPid = null,
+    port = CDP_PORT,
+    timeoutMs = 1800,
+  } = {},
+) {
+  if (connection && !connection.closed) {
+    try {
+      const closeRequest = Promise.resolve(connection.send("Browser.close"))
+        .catch(() => undefined);
+      await Promise.race([closeRequest, sleep(500)]);
+    } catch {}
+  }
+  try { if (connection) connection.close(); } catch {}
+  if (ownsBrowser && browserPid) killGroup(browserPid);
+
+  const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+  while (Date.now() < deadline) {
+    if (!(await getWsEndpoint(port, 100))) return true;
+    await sleep(50);
+  }
+  return !(await getWsEndpoint(port, 100));
 }
 
 // Launch one browser binary and wait for its CDP endpoint. Resolves

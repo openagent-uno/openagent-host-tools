@@ -22,6 +22,7 @@ import path from "node:path";
 import { CDPConnection } from "./cdp.js";
 import {
   ensureBrowser, VIEWPORT, CDP_PORT,
+  closeDedicatedBrowser,
   installExtension, removeManagedExtension, listManagedExtensions, getBrowserVersion,
 } from "./browser.js";
 import { PAGE_SCRIPT } from "./page-script.js";
@@ -270,13 +271,11 @@ class BrowserController {
   // Tear down the owned browser and relaunch it — used to apply an extension
   // change (extensions only load at launch).
   async relaunch() {
-    try { if (this.cdp && !this.cdp.closed) await this.cdp.send("Browser.close"); } catch {}
-    try { if (this.cdp) this.cdp.close(); } catch {}
-    if (this.ownsBrowser && this.browserPid) {
-      try { process.kill(-this.browserPid, "SIGTERM"); } catch {
-        try { process.kill(this.browserPid, "SIGTERM"); } catch {}
-      }
-    }
+    await closeDedicatedBrowser(this.cdp, {
+      ownsBrowser: this.ownsBrowser,
+      browserPid: this.browserPid,
+      port: CDP_PORT,
+    });
     this.cdp = null;
     this.ownsBrowser = false;
     this.browserPid = null;
@@ -285,22 +284,18 @@ class BrowserController {
     this.network.clear();
     this.intByTarget.clear();
     this.targetById.clear();
-    await sleep(1200); // let the CDP port + profile lock release
     await this.ensure();
   }
 
   async shutdown() {
-    try {
-      if (this.cdp) this.cdp.close();
-    } catch {}
-    // Only kill the browser if THIS process launched it (never a reused one).
-    // Kill the whole detached process group (negative pid) so an xvfb-run
-    // wrapper + Chrome + helpers all go down together.
-    if (this.ownsBrowser && this.browserPid) {
-      try { process.kill(-this.browserPid, "SIGTERM"); } catch {
-        try { process.kill(this.browserPid, "SIGTERM"); } catch {}
-      }
-    }
+    await closeDedicatedBrowser(this.cdp, {
+      ownsBrowser: this.ownsBrowser,
+      browserPid: this.browserPid,
+      port: CDP_PORT,
+    });
+    this.cdp = null;
+    this.ownsBrowser = false;
+    this.browserPid = null;
   }
 }
 

@@ -182,6 +182,48 @@ process.stdout.write(JSON.stringify(result));
         thread.join(timeout=5)
 
 
+def test_reused_dedicated_browser_is_closed_by_the_restarted_sidecar():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required to exercise the Agent in Chrome sidecar")
+    browser_js = (
+        Path(__file__).parents[1]
+        / "sidecars"
+        / "agent-in-chrome"
+        / "host"
+        / "browser.js"
+    )
+    script = r"""
+import { pathToFileURL } from "node:url";
+const browser = await import(pathToFileURL(process.argv[1]).href);
+const calls = [];
+const connection = {
+  closed: false,
+  async send(method) { calls.push(method); },
+  close() { this.closed = true; calls.push("connection.close"); },
+};
+const released = await browser.closeDedicatedBrowser(connection, {
+  ownsBrowser: false,
+  browserPid: null,
+  port: 0,
+  timeoutMs: 0,
+});
+process.stdout.write(JSON.stringify({ calls, closed: connection.closed, released }));
+"""
+    completed = subprocess.run(
+        [node, "--input-type=module", "--eval", script, str(browser_js)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert json.loads(completed.stdout) == {
+        "calls": ["Browser.close", "connection.close"],
+        "closed": True,
+        "released": True,
+    }
+
+
 def test_browser_runtime_has_no_mutable_snapshot_download_path():
     node = shutil.which("node")
     if node is None:

@@ -540,6 +540,25 @@ class CapabilityHost:
                     except HostError as exc:
                         await self._audit_denial(call_id, principal, server, tool, args, exc.code)
                         raise
+                    principal_health = getattr(
+                        provider, "availability_for_principal", None
+                    )
+                    if principal_health is not None:
+                        available, reason = principal_health(principal)
+                        if not available:
+                            await self._audit_denial(
+                                call_id,
+                                principal,
+                                server,
+                                tool,
+                                args,
+                                "plugin_unavailable",
+                            )
+                            raise HostError(
+                                "plugin_unavailable",
+                                reason
+                                or "agent-in-chrome is restarting for this account",
+                            )
                 if server == "computer-control" and args.get("action") in {
                     "start_screen_recording",
                     "stop_screen_recording",
@@ -883,6 +902,22 @@ class CapabilityHost:
             restart_initial_delay=self.external_restart_initial_delay,
             restart_max_delay=self.external_restart_max_delay,
         )
+        # Register the unavailable generation before launch so a transient
+        # first-start failure can remain supervised and publish its later
+        # recovery through the normal state-change callback.
+        self._servers[spec.name] = adapter
+        self._external_names.add(spec.name)
+        base = placeholder or adapter.manifest
+        self._inventory[spec.name] = replace(
+            base,
+            available=False,
+            unavailable_reason=f"MCP {spec.name!r} is starting",
+        )
+        self._health[spec.name] = {
+            "available": False,
+            "reason": f"MCP {spec.name!r} is starting",
+            "source": source,
+        }
         try:
             await adapter.start()
         except Exception as exc:  # failure isolation: one plugin never removes core tools
@@ -894,6 +929,9 @@ class CapabilityHost:
                 available=False,
                 unavailable_reason=str(exc),
             )
+            adapter.manifest = replace(
+                manifest, available=False, unavailable_reason=str(exc)
+            )
             self._inventory[spec.name] = replace(
                 manifest, available=False, unavailable_reason=str(exc)
             )
@@ -902,11 +940,14 @@ class CapabilityHost:
                 "reason": str(exc),
                 "source": source,
             }
+            adapter.supervise_initial_failure(exc)
             return
-        self._servers[spec.name] = adapter
-        self._external_names.add(spec.name)
         self._inventory[spec.name] = adapter.manifest
-        self._health[spec.name] = {"available": True, "reason": None, "source": source}
+        self._health[spec.name] = {
+            "available": adapter.manifest.available,
+            "reason": adapter.manifest.unavailable_reason,
+            "source": source,
+        }
 
     async def _start_chrome_pool(self, spec: PluginSpec, *, placeholder: ServerManifest) -> None:
         adapter = PerPrincipalMCPPool(
@@ -918,20 +959,32 @@ class CapabilityHost:
             restart_initial_delay=self.external_restart_initial_delay,
             restart_max_delay=self.external_restart_max_delay,
         )
+        self._servers[spec.name] = adapter
+        self._external_names.add(spec.name)
+        self._inventory[spec.name] = replace(
+            placeholder,
+            available=False,
+            unavailable_reason=f"MCP {spec.name!r} is starting",
+        )
+        self._health[spec.name] = {
+            "available": False,
+            "reason": f"MCP {spec.name!r} is starting",
+            "source": "sidecar-per-network-account",
+        }
         try:
             await adapter.start()
         except Exception as exc:
-            self._inventory[spec.name] = replace(
-                placeholder, available=False, unavailable_reason=str(exc)
+            adapter.manifest = replace(
+                adapter.manifest, available=False, unavailable_reason=str(exc)
             )
+            self._inventory[spec.name] = adapter.manifest
             self._health[spec.name] = {
                 "available": False,
                 "reason": str(exc),
-                "source": "sidecar",
+                "source": "sidecar-per-network-account",
             }
+            adapter.supervise_initial_failure(exc)
             return
-        self._servers[spec.name] = adapter
-        self._external_names.add(spec.name)
         self._inventory[spec.name] = adapter.manifest
         self._health[spec.name] = {
             "available": True,

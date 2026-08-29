@@ -77,6 +77,25 @@ class MCPStdioServer:
             self._restart_requested = False
             await self._launch()
 
+    def supervise_initial_failure(self, error: BaseException) -> None:
+        """Keep a failed first launch under the normal bounded supervisor.
+
+        ``_watch_process`` deliberately ignores a process which never became
+        ready because the caller still owns initial registration.  Once that
+        caller has published this adapter as unavailable, it invokes this
+        method so transient spawn/initialize/catalog failures receive the same
+        restart policy as a runtime crash.
+        """
+
+        if self._closing:
+            return
+        self.manifest = replace(
+            self.manifest,
+            available=False,
+            unavailable_reason=str(error),
+        )
+        self._schedule_restart()
+
     async def _launch(self) -> None:
         env = os.environ.copy()
         env.update(self.spec.env)
@@ -368,14 +387,17 @@ class MCPStdioServer:
             self.manifest, available=False, unavailable_reason=reason
         )
         await self._notify_state_change()
-        if self._restart_attempts >= self.restart_limit:
+        self._schedule_restart()
+
+    def _schedule_restart(self) -> None:
+        if self._closing or self._restart_attempts >= self.restart_limit:
             return
         if self._restart_task is not None and not self._restart_task.done():
             self._restart_requested = True
-        else:
-            self._restart_task = asyncio.create_task(
-                self._restart_loop(), name=f"mcp-restart-{self.spec.name}"
-            )
+            return
+        self._restart_task = asyncio.create_task(
+            self._restart_loop(), name=f"mcp-restart-{self.spec.name}"
+        )
 
     async def _restart_loop(self) -> None:
         try:
@@ -491,26 +513,91 @@ class PerPrincipalMCPPool:
         self._principal_accounts: dict[str, str] = {}
         self._account_principals: dict[str, set[str]] = {}
         self._instance_health: dict[str, bool] = {}
+        self._instance_reasons: dict[str, str | None] = {}
         self._guard = asyncio.Lock()
+        self._probe_lock = asyncio.Lock()
+        self._probe_ready = False
+        self._probe_restart_attempts = 0
+        self._probe_restart_task: asyncio.Task[None] | None = None
         self._closing = False
 
     async def start(self) -> None:
         """Probe the real MCP handshake/catalog in an isolated throwaway slot."""
-        probe_key = "catalog-probe"
-        adapter, lease = self._build(probe_key, supervise=False)
-        try:
-            await adapter.start()
-            self.manifest = replace(
-                adapter.manifest,
-                platforms=self.placeholder.platforms,
-                os_requirements=self.placeholder.os_requirements,
-                data_directory=str(self.data_root),
-                available=True,
-                unavailable_reason=None,
+        async with self._probe_lock:
+            if self._probe_ready:
+                return
+            probe_key = "catalog-probe"
+            adapter, lease = self._build(probe_key, supervise=False)
+            try:
+                await adapter.start()
+                self.manifest = replace(
+                    adapter.manifest,
+                    platforms=self.placeholder.platforms,
+                    os_requirements=self.placeholder.os_requirements,
+                    data_directory=str(self.data_root),
+                    available=True,
+                    unavailable_reason=None,
+                )
+                self._probe_ready = True
+            finally:
+                await adapter.close()
+                lease.close()
+
+    def supervise_initial_failure(self, error: BaseException) -> None:
+        """Retry a transient failure of the pool's catalog probe."""
+
+        if self._closing:
+            return
+        self.manifest = replace(
+            self.manifest,
+            available=False,
+            unavailable_reason=str(error),
+        )
+        if (
+            self._probe_restart_attempts < self.restart_limit
+            and (
+                self._probe_restart_task is None
+                or self._probe_restart_task.done()
             )
+        ):
+            self._probe_restart_task = asyncio.create_task(
+                self._probe_restart_loop(),
+                name=f"mcp-probe-restart-{self.spec.name}",
+            )
+
+    async def _probe_restart_loop(self) -> None:
+        try:
+            while self._probe_restart_attempts < self.restart_limit:
+                attempt = self._probe_restart_attempts + 1
+                delay = min(
+                    self.restart_max_delay,
+                    self.restart_initial_delay * (2 ** (attempt - 1)),
+                )
+                if delay:
+                    await asyncio.sleep(delay)
+                if self._closing:
+                    return
+                self._probe_restart_attempts = attempt
+                try:
+                    await self.start()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    self.manifest = replace(
+                        self.manifest,
+                        available=False,
+                        unavailable_reason=(
+                            f"MCP {self.spec.name!r} catalog restart {attempt}/"
+                            f"{self.restart_limit} failed: {exc}"
+                        ),
+                    )
+                    await self._notify_state_change()
+                    continue
+                await self._notify_state_change()
+                return
         finally:
-            await adapter.close()
-            lease.close()
+            if self._probe_restart_task is asyncio.current_task():
+                self._probe_restart_task = None
 
     async def call(self, tool: str, args: dict[str, Any]) -> ToolResult:
         principal = current_principal.get()
@@ -524,17 +611,41 @@ class PerPrincipalMCPPool:
                 adapter, lease = self._build(key)
                 try:
                     await adapter.start()
-                except Exception:
-                    await adapter.close()
-                    lease.close()
+                except Exception as exc:
+                    # Retain the failed generation so its bounded supervisor
+                    # can recover without requiring another tool call.  The
+                    # instance is scoped to this exact network/account and
+                    # must not affect healthy instances in the pool.
+                    self._instances[key] = adapter
+                    self._ports[key] = lease
+                    self._instance_health[key] = False
+                    self._instance_reasons[key] = str(exc)
+                    adapter.supervise_initial_failure(exc)
                     raise
                 self._instances[key] = adapter
                 self._ports[key] = lease
                 self._instance_health[key] = True
+                self._instance_reasons[key] = None
         return await adapter.call(tool, args)
 
+    def availability_for_principal(self, principal: str) -> tuple[bool, str | None]:
+        """Return health for one certified network/account only.
+
+        A per-principal Chrome process can be restarting while another account
+        on the same computer remains completely healthy.  The pool's public
+        manifest therefore describes whether the module is installed, while
+        dispatch consults this narrower health view.
+        """
+
+        key = _chrome_principal_key(principal)
+        if key not in self._instances:
+            return True, None
+        return (
+            self._instance_health.get(key, False),
+            self._instance_reasons.get(key),
+        )
+
     async def release_principal(self, principal: str) -> None:
-        notify = False
         async with self._guard:
             key = self._principal_accounts.pop(principal, None)
             if key is None:
@@ -548,16 +659,20 @@ class PerPrincipalMCPPool:
             adapter = self._instances.pop(key, None)
             lease = self._ports.pop(key, None)
             self._instance_health.pop(key, None)
-            notify = self._refresh_health_locked()
+            self._instance_reasons.pop(key, None)
         if adapter is not None:
             await adapter.close()
         if lease is not None:
+            await _wait_until_port_free(lease.port)
             lease.close()
-        if notify:
-            await self._notify_state_change()
 
     async def close(self) -> None:
         self._closing = True
+        probe_restart = self._probe_restart_task
+        if probe_restart is not None and probe_restart is not asyncio.current_task():
+            probe_restart.cancel()
+            await asyncio.gather(probe_restart, return_exceptions=True)
+        self._probe_restart_task = None
         async with self._guard:
             instances = list(self._instances.values())
             leases = list(self._ports.values())
@@ -566,8 +681,10 @@ class PerPrincipalMCPPool:
             self._principal_accounts.clear()
             self._account_principals.clear()
             self._instance_health.clear()
+            self._instance_reasons.clear()
         await asyncio.gather(*(adapter.close() for adapter in instances), return_exceptions=True)
         for lease in leases:
+            await _wait_until_port_free(lease.port)
             lease.close()
 
     def _build(
@@ -612,32 +729,7 @@ class PerPrincipalMCPPool:
             if self._instances.get(key) is not adapter:
                 return
             self._instance_health[key] = adapter.manifest.available
-            changed = self._refresh_health_locked()
-        if changed:
-            await self._notify_state_change()
-
-    def _refresh_health_locked(self) -> bool:
-        available = all(self._instance_health.values())
-        reason = None
-        if not available:
-            reason = next(
-                (
-                    instance.manifest.unavailable_reason
-                    for instance_key, instance in self._instances.items()
-                    if not self._instance_health.get(instance_key, True)
-                ),
-                "agent-in-chrome sidecar is unavailable",
-            )
-        changed = (
-            self.manifest.available != available
-            or self.manifest.unavailable_reason != reason
-        )
-        self.manifest = replace(
-            self.manifest,
-            available=available,
-            unavailable_reason=reason,
-        )
-        return changed
+            self._instance_reasons[key] = adapter.manifest.unavailable_reason
 
     async def _notify_state_change(self) -> None:
         if self.on_state_change is None:
@@ -750,4 +842,15 @@ def _port_is_free(port: int) -> bool:
             sock.bind(("127.0.0.1", port))
         except OSError:
             return False
+    return True
+
+
+async def _wait_until_port_free(port: int, timeout: float = 3.0) -> bool:
+    """Keep the cross-process port lease until Chromium has really exited."""
+
+    deadline = asyncio.get_running_loop().time() + max(0.0, timeout)
+    while not _port_is_free(port):
+        if asyncio.get_running_loop().time() >= deadline:
+            return False
+        await asyncio.sleep(0.05)
     return True

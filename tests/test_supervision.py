@@ -19,6 +19,8 @@ _SUPERVISED_MCP = r'''import json, os, pathlib, sys, threading
 state = pathlib.Path(os.environ["TEST_STATE_PATH"])
 generation = int(state.read_text()) + 1 if state.exists() else 1
 state.write_text(str(generation))
+if generation == 1 and os.environ.get("TEST_FAIL_FIRST_START") == "1":
+    sys.exit(29)
 
 def reply(request_id, result):
     print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
@@ -153,7 +155,6 @@ async def test_stdio_shutdown_cancels_a_pending_backoff_restart(tmp_path: Path):
 async def test_per_principal_sidecar_death_updates_health_and_restarts(tmp_path: Path):
     script = _write_mcp(tmp_path)
     state = tmp_path / "chrome-starts.txt"
-    changes: list[bool] = []
     pool = PerPrincipalMCPPool(
         PluginSpec(
             "agent-in-chrome",
@@ -166,34 +167,147 @@ async def test_per_principal_sidecar_death_updates_health_and_restarts(tmp_path:
         ),
         placeholder=AGENT_IN_CHROME_MANIFEST,
         data_root=tmp_path / "chrome",
-        on_state_change=lambda sidecar: changes.append(sidecar.manifest.available),
         restart_limit=1,
-        restart_initial_delay=0.01,
-        restart_max_delay=0.01,
+        restart_initial_delay=0.2,
+        restart_max_delay=0.2,
     )
     await pool.start()
-    principal = json.dumps(
+    principal_a = json.dumps(
         {
             "kind": "interactive-client",
-            "client_instance_id": "desktop",
+            "client_instance_id": "desktop-a",
             "account_id": "account-a",
             "network_id": "network-a",
         }
     )
-    token = current_principal.set(principal)
+    principal_b = json.dumps(
+        {
+            "kind": "interactive-client",
+            "client_instance_id": "desktop-b",
+            "account_id": "account-b",
+            "network_id": "network-b",
+        }
+    )
     try:
+        token_b = current_principal.set(principal_b)
+        healthy_b = await pool.call("inspect", {})
+        current_principal.reset(token_b)
+
+        token_a = current_principal.set(principal_a)
         with pytest.raises(HostError, match="disconnected"):
             await pool.call("mutate", {"crash": True})
-        await _wait_until(lambda: changes == [False, True])
+        current_principal.reset(token_a)
+        await _wait_until(
+            lambda: pool.availability_for_principal(principal_a)[0] is False
+        )
+
+        # One failed network/account must not remove Chrome from the machine's
+        # catalog or reject a different account whose sidecar is still alive.
         assert pool.manifest.available is True
+        assert pool.availability_for_principal(principal_b) == (True, None)
+        token_b = current_principal.set(principal_b)
+        still_healthy_b = await pool.call("inspect", {})
+        current_principal.reset(token_b)
+        assert still_healthy_b.structured_content == healthy_b.structured_content
+
+        await _wait_until(
+            lambda: pool.availability_for_principal(principal_a)[0] is True
+        )
+        token_a = current_principal.set(principal_a)
         recovered = await pool.call("inspect", {})
-        assert recovered.structured_content["generation"] == 3
+        current_principal.reset(token_a)
+        assert recovered.structured_content["generation"] == 4
     finally:
-        current_principal.reset(token)
+        current_principal.set(None)
         await pool.close()
     starts_after_close = state.read_text(encoding="utf-8")
     await asyncio.sleep(0.05)
     assert state.read_text(encoding="utf-8") == starts_after_close
+
+
+@pytest.mark.asyncio
+async def test_host_supervises_a_transient_failure_on_the_first_start(tmp_path: Path):
+    script = _write_mcp(tmp_path)
+    paths = HostPaths.discover(tmp_path / "first-start-user")
+    state = tmp_path / "first-starts.txt"
+    host = CapabilityHost(
+        paths=paths,
+        cwd=tmp_path,
+        external_restart_limit=2,
+        external_restart_initial_delay=0.01,
+        external_restart_max_delay=0.01,
+    )
+    host.plugin_store.save(
+        [
+            PluginSpec(
+                "first-start",
+                (sys.executable, str(script)),
+                env={
+                    "TEST_STATE_PATH": str(state),
+                    "TEST_SERVER_NAME": "first-start",
+                    "TEST_FAIL_FIRST_START": "1",
+                },
+            )
+        ]
+    )
+    try:
+        await host.set_consent(True)
+        await _wait_until(
+            lambda: state.exists()
+            and state.read_text(encoding="utf-8") == "2"
+            and host._health["first-start"]["available"] is True
+        )
+        assert "first-start" in {
+            server["name"] for server in await host.catalog()
+        }
+        result = await host.call(
+            "first-start",
+            "inspect",
+            {},
+            principal="first-start-principal",
+            call_id="first-start-call",
+        )
+        assert result.structured_content == {"generation": 2}
+    finally:
+        await host.close()
+
+
+@pytest.mark.asyncio
+async def test_host_supervises_transient_chrome_catalog_probe_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    script = _write_mcp(tmp_path)
+    paths = HostPaths.discover(tmp_path / "chrome-probe-user")
+    state = tmp_path / "chrome-probe-starts.txt"
+    monkeypatch.setenv(
+        "OPENAGENT_AGENT_IN_CHROME_COMMAND",
+        json.dumps([sys.executable, str(script)]),
+    )
+    monkeypatch.setenv("TEST_STATE_PATH", str(state))
+    monkeypatch.setenv("TEST_SERVER_NAME", "agent-in-chrome")
+    monkeypatch.setenv("TEST_FAIL_FIRST_START", "1")
+    host = CapabilityHost(
+        paths=paths,
+        cwd=tmp_path,
+        external_restart_limit=2,
+        external_restart_initial_delay=0.01,
+        external_restart_max_delay=0.01,
+    )
+    try:
+        await host.set_consent(True)
+        await _wait_until(
+            lambda: state.exists()
+            and state.read_text(encoding="utf-8") == "2"
+            and host._health["agent-in-chrome"]["available"] is True
+        )
+        chrome = next(
+            server
+            for server in await host.catalog()
+            if server["name"] == "agent-in-chrome"
+        )
+        assert {tool["name"] for tool in chrome["tools"]} == {"mutate", "inspect"}
+    finally:
+        await host.close()
 
 
 @pytest.mark.asyncio
