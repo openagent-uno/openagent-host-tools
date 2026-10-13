@@ -1,0 +1,33 @@
+name: Assemble qualified compatibility draft
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  draft:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Assemble source-bound draft without publishing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/assemble_compat_draft.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: compatibility-0.1.3-source-proof
+          path: |
+            draft-artifacts/release-index.json
+            draft-artifacts/SHA256SUMS
+            draft-artifacts/source-proof.json
+            draft-artifacts/mac-signing-qualification.json
+          if-no-files-found: error
