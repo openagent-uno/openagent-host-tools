@@ -259,8 +259,10 @@ def _spawn_broker(paths: HostPaths) -> None:
 
 
 def _write_stdout(data: str) -> None:
-    sys.stdout.write(data)
-    sys.stdout.flush()
+    # NDJSON is UTF-8 on the wire, including frozen Windows executables whose
+    # TextIOWrapper can use a legacy code page independently of Python env vars.
+    sys.stdout.buffer.write(data.encode("utf-8"))
+    sys.stdout.buffer.flush()
 
 
 async def _run_broker_until_signal() -> None:
