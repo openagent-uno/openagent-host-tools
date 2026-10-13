@@ -1,0 +1,81 @@
+name: Compatibility UTF-8 native qualification
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  frozen:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: macos-15, platform: darwin-arm64}
+          - {runner: macos-15-intel, platform: darwin-x64}
+          - {runner: ubuntu-24.04, platform: linux-x64}
+          - {runner: ubuntu-24.04-arm, platform: linux-arm64}
+          - {runner: windows-2022, platform: win32-x64}
+          - {runner: windows-11-arm, platform: win32-arm64}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.9.12'
+      - name: Provision pinned OpenSSL for unchanged cryptography on Windows ARM64
+        if: matrix.platform == 'win32-arm64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vcpkgRoot = Join-Path $env:RUNNER_TEMP 'openagent-vcpkg'
+          git clone --filter=blob:none --no-checkout https://github.com/microsoft/vcpkg.git $vcpkgRoot
+          git -C $vcpkgRoot checkout 114d9fe62faf35856b45cf55cb93b57028a45d63
+          & (Join-Path $vcpkgRoot 'bootstrap-vcpkg.bat') -disableMetrics
+          & (Join-Path $vcpkgRoot 'vcpkg.exe') install openssl:arm64-windows-static-md
+          "OPENSSL_DIR=$(Join-Path $vcpkgRoot 'installed\arm64-windows-static-md')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "OPENSSL_STATIC=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Install unchanged locked dependency closure
+        shell: bash
+        run: |
+          uv export --frozen --extra dev --no-emit-project --output-file "$RUNNER_TEMP/locked.txt" >/dev/null
+          python -m pip install --no-deps --require-hashes -r "$RUNNER_TEMP/locked.txt"
+          python -m pip install --no-deps -e .
+          python -m pip install pyinstaller==6.22.3 build==1.6.1
+          python -m pip check
+      - name: Test and refreeze without recompiling native sidecars
+        shell: bash
+        run: |
+          python -m pytest -q
+          python scripts/refreeze_compat_bundle.py
+      - name: Real frozen Unicode initialize, status and shutdown
+        shell: bash
+        run: |
+          suffix=""
+          if [[ '${{ runner.os }}' == Windows ]]; then suffix=.exe; fi
+          python scripts/smoke_ndjson_utf8.py "dist/${{ matrix.platform }}/openagent-host-tools$suffix"
+          python scripts/smoke_bundle.py "dist/${{ matrix.platform }}" --core-only --computer-control skip
+          python scripts/package_bundle.py "dist/${{ matrix.platform }}"
+          python scripts/verify_bundle_archive.py "dist/openagent-host-tools-${{ matrix.platform }}.tar.gz" "$RUNNER_TEMP/final-verified"
+          python -m build --wheel
+          python -m pip freeze > "dist/dependencies-${{ matrix.platform }}.txt"
+          git rev-parse HEAD > "dist/source-${{ matrix.platform }}.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: utf8-qualified-${{ matrix.platform }}
+          path: |
+            dist/openagent-host-tools-*.tar.gz*
+            dist/compatibility-*.json
+            dist/source-*.txt
+            dist/dependencies-*.txt
+            dist/*.whl
+          if-no-files-found: error
+          retention-days: 14

@@ -54,3 +54,20 @@ a standard `notifications/message` logging notification from logger
 by the embedded capability host. MCP consumers should register a logging
 callback and route that logger's data into the agent event/autoloop path rather
 than treating it as diagnostic text.
+
+## Compatibility UTF-8 patch 0.1.3
+
+This narrowly scoped transition release keeps the `openagent-host-tools/1`
+protocol and 0.1.2 dependency lock. NDJSON output is encoded explicitly as UTF-8
+bytes, so a frozen Windows process cannot serialize Unicode using CP1252.
+The same correction is submitted to the canonical monorepo. No Core dependency
+is added or upgraded. This repository is reopened only for this compatibility
+release and will return to its archived state after publication.
+
+`compat-utf8.yml` builds the Python executable on all six native runners and
+checks real non-ASCII initialize/status/shutdown frames. Native sidecars, Node
+and browser runtime files are reused byte-for-byte from the checksum-pinned
+0.1.2 release; `compatibility-<platform>.json` records their hashes. The frozen
+MCP core smoke and archive verifier also run. These are qualification candidates,
+not public releases: macOS signing/notarization and the final release-index
+verification must finish before an immutable 0.1.3 release is published.
