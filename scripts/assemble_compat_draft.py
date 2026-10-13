@@ -44,6 +44,14 @@ def digest(path: Path) -> str:
 def main() -> None:
     run = json.loads(gh("api", f"repos/{REPO}/actions/runs/{RUN}"))
     assert run["head_sha"] == SOURCE and run["conclusion"] == "success"
+    assert run["head_repository"]["full_name"] == REPO
+    reference = json.loads(gh("api", f"repos/{REPO}/git/ref/tags/{TAG}"))["object"]
+    visited = set()
+    while reference["type"] == "tag":
+        assert reference["sha"] not in visited and len(visited) < 5
+        visited.add(reference["sha"])
+        reference = json.loads(gh("api", f"repos/{REPO}/git/tags/{reference['sha']}"))["object"]
+    assert reference["type"] == "commit" and reference["sha"] == SOURCE
     jobs = json.loads(gh("api", f"repos/{REPO}/actions/runs/{RUN}/jobs?per_page=100"))["jobs"]
     assert len(jobs) == 6 and all(job["conclusion"] == "success" for job in jobs)
     subprocess.run(["git", "merge-base", "--is-ancestor", SOURCE, "HEAD"], check=True)
